@@ -12,6 +12,8 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 - Fixed incorrect hover tips.
 - Added an extended double-click selection mode, similar to Source Insight: double-clicking to the left of a bracket selects the bracket pair together with its contents.
 - Fixed incorrect keyword style settings.
+- Improved external navigation for UNC shares, encoded paths, and alternate file URI forms.
+- Restored full filename/path tooltips and horizontal scrolling for long paths in the bottom bar.
 
 ## [1.0.2] 2026.06.30
 

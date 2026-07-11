@@ -69,6 +69,7 @@ export function createDefinitionList(editor) {
         const pathContainer = filenameDisplay?.querySelector('.filename-path');
         const icon = pathContainer?.querySelector('.filename-icon');
         const pathText = pathContainer?.querySelector('.filename-path-text');
+        const filenameText = filenameDisplay?.querySelector('.filename-text');
         if (uri && filenameDisplay) {
             let filePath = uri;
             try {
@@ -81,17 +82,27 @@ export function createDefinitionList(editor) {
             //const displayText = `${filename}       (${filePath})`;
             //console.log('[definition] File name:', filename, uri);
             //filenameDisplay.textContent = displayText || '';
-            filenameDisplay.querySelector('.filename-text').textContent = filename;
+            filenameText.textContent = filename;
+            filenameText.title = filename || '';
+            filenameDisplay.title = filePath;
+            pathContainer.title = filePath;
             icon.textContent = '📄'; // 你想用的Unicode图标
             icon.style.display = 'inline-block';
             pathText.textContent = filePath;
+            pathText.title = filePath;
+            pathContainer.scrollLeft = 0;
             // 有文件名显示时才显示底部 { } 指示器
             document.body.classList.add('ctx-has-file');
         } else if (filenameDisplay) {
-            filenameDisplay.querySelector('.filename-text').textContent = "";
+            filenameText.textContent = "";
+            filenameText.title = "";
+            filenameDisplay.title = "";
+            pathContainer.title = "";
             icon.textContent = "";
             icon.style.display = 'none';
             pathText.textContent = "";
+            pathText.title = "";
+            pathContainer.scrollLeft = 0;
             // 无文件名显示时同时隐藏 { } 指示器
             document.body.classList.remove('ctx-has-file');
         }

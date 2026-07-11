@@ -508,6 +508,56 @@ body.si-revealed .double-click-area {
     flex: 1;
     padding: 0;
 }
+.double-click-area {
+    align-items: center;
+    justify-content: flex-start;
+    padding: 0 10px;
+    box-sizing: border-box;
+    overflow: hidden;
+}
+
+.filename-display {
+    width: 100%;
+    min-width: 0;
+    gap: 12px;
+}
+
+.filename-text {
+    max-width: 240px;
+    flex-shrink: 0;
+}
+
+.filename-path {
+    align-items: center;
+    margin-left: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: thin;
+    scrollbar-color: var(--vscode-scrollbarSlider-background) transparent;
+}
+
+.filename-path-text {
+    overflow: visible;
+    text-overflow: clip;
+    flex: 0 0 auto;
+}
+
+.filename-path::-webkit-scrollbar {
+    height: 6px;
+}
+
+.filename-path::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.filename-path::-webkit-scrollbar-thumb {
+    background: rgba(128, 128, 128, 0.35);
+    border-radius: 3px;
+}
+
+.filename-path:hover::-webkit-scrollbar-thumb {
+    background: rgba(128, 128, 128, 0.55);
+}
 .custom-context-menu {
     position: fixed;
     background: #ffffff;/*var(--vscode-menu-background, #fff);*/

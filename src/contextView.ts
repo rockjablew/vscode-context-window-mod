@@ -516,6 +516,179 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
         this._currentPanel?.webview.postMessage(message);
     }
 
+    private sanitizeNavigateUriInput(rawUri: string): string {
+        let normalized = rawUri.trim();
+
+        try {
+            normalized = decodeURIComponent(normalized);
+        } catch {
+            // Keep malformed percent-encoding unchanged so other candidates can still be tried.
+        }
+
+        const nestedFilePrefix = /^file:\/\/\/file:\/+/i;
+        if (nestedFilePrefix.test(normalized)) {
+            normalized = normalized.replace(nestedFilePrefix, '//');
+        }
+
+        normalized = normalized.replace(/^file:\\+/i, '\\\\');
+        normalized = normalized.replace(/^file:\/\//i, '//');
+
+        return normalized;
+    }
+
+    private createNavigateUriCandidates(rawUri: string): vscode.Uri[] {
+        const trimmed = this.sanitizeNavigateUriInput(rawUri);
+        const candidates: vscode.Uri[] = [];
+
+        const pushCandidate = (candidate: vscode.Uri | undefined) => {
+            if (!candidate) {
+                return;
+            }
+
+            const key = candidate.toString();
+            if (!candidates.some(item => item.toString() === key)) {
+                candidates.push(candidate);
+            }
+        };
+
+        const buildUncCandidates = (networkPath: string) => {
+            const withoutLeading = networkPath.replace(/^[\\/]{2}/, '');
+            const backslashPath = withoutLeading.replace(/\//g, '\\');
+            const firstSeparator = backslashPath.indexOf('\\');
+            if (firstSeparator <= 0) {
+                return;
+            }
+
+            const authority = backslashPath.slice(0, firstSeparator);
+            const pathPart = backslashPath.slice(firstSeparator).replace(/\\/g, '/');
+            const normalizedPath = pathPart.startsWith('/') ? pathPart : `/${pathPart}`;
+
+            pushCandidate(vscode.Uri.from({ scheme: 'file', authority, path: normalizedPath }));
+            pushCandidate(vscode.Uri.parse(`file://${authority}${normalizedPath}`));
+            pushCandidate(vscode.Uri.file(`\\\\${authority}${normalizedPath.replace(/\//g, '\\')}`));
+        };
+
+        const getKnownNetworkMappings = (): Array<{ authority: string; shareName: string }> => {
+            const sources = [
+                vscode.window.activeTextEditor?.document.uri,
+                this._lastUpdateEditor?.document.uri,
+                this.currentUri,
+                ...(vscode.workspace.workspaceFolders ?? []).map(folder => folder.uri)
+            ];
+            const mappings: Array<{ authority: string; shareName: string }> = [];
+
+            const pushMapping = (authority: string | undefined, sharePath: string | undefined) => {
+                if (!authority || !sharePath) {
+                    return;
+                }
+
+                const shareName = sharePath.replace(/\\/g, '/').split('/').filter(Boolean)[0];
+                if (shareName && !mappings.some(item => item.authority === authority && item.shareName === shareName)) {
+                    mappings.push({ authority, shareName });
+                }
+            };
+
+            for (const source of sources) {
+                if (!source || source.scheme !== 'file') {
+                    continue;
+                }
+
+                if (source.authority) {
+                    pushMapping(source.authority, source.path);
+                    continue;
+                }
+
+                const fsPath = source.fsPath;
+                if (fsPath.startsWith('\\\\')) {
+                    const withoutLeading = fsPath.replace(/^\\\\/, '');
+                    const firstSeparator = withoutLeading.indexOf('\\');
+                    if (firstSeparator > 0) {
+                        pushMapping(
+                            withoutLeading.slice(0, firstSeparator),
+                            withoutLeading.slice(firstSeparator).replace(/\\/g, '/')
+                        );
+                    }
+                }
+            }
+
+            return mappings;
+        };
+
+        const pushCandidatesFromKnownMappings = (sharePathLike: string) => {
+            const normalizedSharePath = sharePathLike.replace(/\\/g, '/');
+            const withLeadingSlash = normalizedSharePath.startsWith('/') ? normalizedSharePath : `/${normalizedSharePath}`;
+            const shareName = withLeadingSlash.split('/').filter(Boolean)[0];
+            if (!shareName) {
+                return;
+            }
+
+            for (const mapping of getKnownNetworkMappings()) {
+                if (mapping.shareName !== shareName) {
+                    continue;
+                }
+
+                pushCandidate(vscode.Uri.from({ scheme: 'file', authority: mapping.authority, path: withLeadingSlash }));
+                pushCandidate(vscode.Uri.parse(`file://${mapping.authority}${withLeadingSlash}`));
+                pushCandidate(vscode.Uri.file(`\\\\${mapping.authority}${withLeadingSlash.replace(/\//g, '\\')}`));
+            }
+        };
+
+        if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed)) {
+            const parsed = vscode.Uri.parse(trimmed);
+            pushCandidate(parsed);
+
+            if (parsed.scheme === 'file') {
+                if (parsed.authority) {
+                    buildUncCandidates(`\\\\${parsed.authority}${parsed.path.replace(/\//g, '\\')}`);
+                } else {
+                    pushCandidate(vscode.Uri.file(parsed.fsPath));
+                }
+            }
+        } else if (trimmed.startsWith('\\\\') || /^\/\/[^/\\]+[\\/]/.test(trimmed)) {
+            buildUncCandidates(trimmed);
+        }
+
+        if ((trimmed.startsWith('/') || trimmed.startsWith('\\')) && !trimmed.startsWith('\\\\')) {
+            pushCandidatesFromKnownMappings(trimmed);
+        }
+
+        if (/^\/\/[^/\\]+[\\/]/.test(trimmed)) {
+            const withoutLeading = trimmed.replace(/^\/+/, '');
+            const firstSeparator = withoutLeading.search(/[\\/]/);
+            if (firstSeparator > 0) {
+                pushCandidatesFromKnownMappings(withoutLeading.slice(firstSeparator));
+                pushCandidatesFromKnownMappings(`/${withoutLeading}`);
+            }
+        }
+
+        pushCandidate(vscode.Uri.file(trimmed));
+        return candidates;
+    }
+
+    private normalizeNavigateUri(rawUri: string): vscode.Uri {
+        return this.createNavigateUriCandidates(rawUri)[0];
+    }
+
+    private async resolveAccessibleNavigateUri(rawUri: string): Promise<vscode.Uri> {
+        const candidates = this.createNavigateUriCandidates(rawUri);
+        let lastError: unknown;
+
+        for (const candidate of candidates) {
+            try {
+                await vscode.workspace.openTextDocument(candidate);
+                return candidate;
+            } catch (error) {
+                lastError = error;
+            }
+        }
+
+        throw lastError ?? new Error(`Unable to open URI: ${this.sanitizeNavigateUriInput(rawUri)}`);
+    }
+
+    private parseExternalUri(rawUri: string | vscode.Uri): vscode.Uri {
+        return rawUri instanceof vscode.Uri ? rawUri : this.normalizeNavigateUri(String(rawUri));
+    }
+
     public async navigateCommand(uri: string, range: { start: { line: number; character: number }; end: { line: number; character: number } }, token: string = '') {
         // Validate input parameters
         if (!uri || typeof uri !== 'string') {
@@ -544,29 +717,11 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
         // Parse and validate URI
         let targetUri: vscode.Uri;
         try {
-            targetUri = vscode.Uri.parse(uri);
+            targetUri = await this.resolveAccessibleNavigateUri(uri);
         } catch (error) {
-            vscode.window.showErrorMessage(`Invalid URI format: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            const message = error instanceof Error ? error.message : 'Unknown error';
+            vscode.window.showErrorMessage(`File not found or not accessible: ${this.sanitizeNavigateUriInput(uri)} (${message})`);
             return;
-        }
-
-        // Check if file exists and is accessible
-        try {
-            // Use workspace.fs to check if file exists
-            try {
-                const stats = await vscode.workspace.fs.stat(targetUri);
-                if (stats.type !== vscode.FileType.File) {
-                    vscode.window.showErrorMessage('The provided URI does not point to a file');
-                    return;
-                }
-            } catch (statError) {
-                // File doesn't exist or is not accessible
-                vscode.window.showErrorMessage(`File not found or not accessible: ${uri}`);
-                return;
-            }
-        } catch (error) {
-            vscode.window.showWarningMessage(`Unable to verify file accessibility, proceeding anyway: ${error instanceof Error ? error.message : 'Unknown error'}`);
-            // Continue anyway - might be a remote file or special URI scheme
         }
 
         const editor = vscode.window.activeTextEditor || this._lastUpdateEditor;
@@ -581,11 +736,14 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
             )
         );
 
-        const contentInfo = await this._renderer.renderDefinition(languageId, definition);
-        this.updateContent(contentInfo);
-        
-        // 使用range的起始位置作为导航行号用于历史记录
-        this.addToHistory(contentInfo, range.start.line);
+        try {
+            const contentInfo = await this._renderer.renderDefinition(languageId, definition);
+            this.updateContent(contentInfo);
+            this.addToHistory(contentInfo, range.start.line);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Unknown error';
+            vscode.window.showErrorMessage(`File not found or not accessible: ${targetUri.fsPath || uri} (${message})`);
+        }
     }
 
     private async handleWebviewMessage(webview: vscode.Webview) {
@@ -782,7 +940,7 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
             return;
         }
         try {
-            const uri = vscode.Uri.parse(message.filePath);
+            const uri = this.parseExternalUri(message.filePath);
             await vscode.commands.executeCommand('revealFileInOS', uri);
         } catch (error) {
             console.error('[context-window] revealInExplorer error:', error);
@@ -812,7 +970,7 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
         // 不再依赖会被下一次 updateContent 覆盖的 _lastContent 单槽。
         (async () => {
             try {
-                const reqUri = vscode.Uri.parse(message.uri);
+                const reqUri = this.parseExternalUri(message.uri);
                 const info = await this._renderer.getContentByUri(reqUri);
                 this.postMessageToWebview({
                     type: 'updateContent',
@@ -848,7 +1006,7 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
             return;
         }
         try {
-            const targetUri = vscode.Uri.parse(message.uri);
+            const targetUri = this.parseExternalUri(message.uri);
             const pos = new vscode.Position(
                 Math.max(0, message.position.line | 0),
                 Math.max(0, message.position.character | 0)
@@ -948,7 +1106,7 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
         const updatePromise = (async () => {
             const definitions = await vscode.commands.executeCommand<vscode.Location[]>(
                 'vscode.executeDefinitionProvider',
-                vscode.Uri.parse(message.uri),
+                this.parseExternalUri(message.uri),
                 new vscode.Position(message.position.line, message.position.character)
             );
 
@@ -988,7 +1146,7 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
         }
 
         const curContext = this.getCurrentContent();
-        this.currentUri = curContext?.content ? vscode.Uri.parse(curContext.content.jmpUri) : undefined;
+        this.currentUri = curContext?.content ? this.parseExternalUri(curContext.content.jmpUri) : undefined;
         this.currentLine = curContext?.content ? curContext.content.range.start.line : 0;
         if (!this.currentUri) {
             return;
@@ -1264,10 +1422,10 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
             <!-- 添加双击区域 -->
             <div class="double-click-area" title="double-click: Jump to definition">
                 <span class="filename-display">
-                    <span class="filename-text"></span>
-                    <span class="filename-path">
+                    <span class="filename-text" title=""></span>
+                    <span class="filename-path" title="">
                         <span class="filename-icon"></span>
-                        <span class="filename-path-text"></span>
+                        <span class="filename-path-text" title=""></span>
                     </span>
                 </span>
             </div>
@@ -1429,7 +1587,7 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
             this._loading = undefined;
             
             if (contentInfo.jmpUri) {
-                this.currentUri = vscode.Uri.parse(contentInfo.jmpUri);
+                this.currentUri = this.parseExternalUri(contentInfo.jmpUri);
                 this.currentLine = contentInfo.range.start.line;
             }
             
