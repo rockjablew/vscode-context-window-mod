@@ -4,8 +4,13 @@ import * as vscode from 'vscode';
 // legend：tokenTypes / tokenModifiers 索引表（由语言服务器提供，按语言而定）。
 // data：LSP 标准 5 元组 delta 编码 [ΔLine, ΔStartChar, length, tokenTypeIdx, tokenModifiers]，
 //       Uint32Array 转成 number[] 以便跨 webview 序列化。
+export interface SemanticLegend {
+    tokenTypes: string[];
+    tokenModifiers: string[];
+}
+
 export interface SemanticPayload {
-    legend: { tokenTypes: string[]; tokenModifiers: string[] };
+    legend: SemanticLegend;
     data: number[];
 }
 
@@ -20,13 +25,30 @@ export interface FileContentInfo {
     documentVersion: number;
     lineCount: number;
     semantic?: SemanticPayload | null; // VSCode 语义 token（按需，可能为空）
+    // 对齐 VSCode：legend 与 data 解耦。legend 快、随内容一起下发，供前端首帧建 styling；
+    // data慢、异步补取。此字段为「仅 legend」，即使 data 尚未取到也可先行下发。
+    legend?: SemanticLegend | null;
 }
+
+// Semantic highlighting is optional enrichment. It must never hold up showing
+// a definition that the language provider has already resolved.
+// 对齐 VSCode 的异步时序后，整篇 data 已移到 fetchSemanticForUri 异步补取，
+// 这里仍保留预算作为兜底：即使异步路径中的语言服务器调用过慢，也会在预算耗尽后
+// 立刻放弃，避免长时间占用语言服务器（executeDefinitionProvider 无法取消）。
+const SEMANTIC_TOKEN_BUDGET_MS = 200;
 
 interface FileCacheEntry {
     content: string;
     languageId: string;
     documentVersion: number;  // 添加：文档版本号
-    semantic?: SemanticPayload | null; // 与内容同版本缓存的语义 token
+    // 与内容同版本缓存的语义 token，三态语义（不要退化成只用 null）：
+    //   undefined = 从未索取过（命中缓存时按需补取并回填）
+    //   null      = 索取过且确认为空（不必重复请求语言服务器）
+    //   Payload   = 索取过且有数据
+    semantic?: SemanticPayload | null;
+    // 仅 legend 的缓存（比 data 便宜很多、稳定）：命中时可直接随内容下发，避免每次重取。
+    //   undefined = 未取过；null = 取过为空；SemanticLegend = 取到
+    legend?: SemanticLegend | null;
 }
 
 // loadContent 的返回结构：仅包含与 range 无关的内容与元数据
@@ -36,6 +58,7 @@ interface LoadedContent {
     documentVersion: number;
     lineCount: number;
     semantic?: SemanticPayload | null;
+    legend?: SemanticLegend | null;
 }
 
 export class Renderer {
@@ -104,14 +127,19 @@ export class Renderer {
     }
 
     public async renderDefinition(languageId: string, def: vscode.Location | vscode.LocationLink): Promise<FileContentInfo> {
-        if (def instanceof vscode.Location) {
-            return await this.getFileContents(def.uri, def.range, languageId);
-        } else {
-            if (def.targetSelectionRange)
-                return await this.getFileContents(def.targetUri, def.targetSelectionRange, languageId);
-            else
-                return await this.getFileContents(def.targetUri, def.targetRange, languageId);
+        // Command results can cross an extension-host boundary and are not
+        // guaranteed to preserve the vscode.Location prototype.
+        const location = def as vscode.Location;
+        if (location?.uri && location?.range) {
+            return await this.getFileContents(location.uri, location.range, languageId);
         }
+
+        const link = def as vscode.LocationLink;
+        const range = link?.targetSelectionRange || link?.targetRange;
+        if (!link?.targetUri || !range) {
+            throw new Error('Definition provider returned an invalid location');
+        }
+        return await this.getFileContents(link.targetUri, range, languageId);
     }
 
     /**
@@ -129,7 +157,8 @@ export class Renderer {
             languageId: loaded.languageId,
             documentVersion: loaded.documentVersion,
             lineCount: loaded.lineCount,
-            semantic: loaded.semantic
+            semantic: loaded.semantic,
+            legend: loaded.legend
         };
     }
 
@@ -143,6 +172,22 @@ export class Renderer {
         return this.loadContent(uri);
     }
 
+    // 取文档对象：优先复用 VSCode 中已存在且未关闭的 TextDocument，只在确实没有时才 openTextDocument。
+    // 为什么不能无脑 openTextDocument：主线程 BoundModelReferenceCollection 对扩展打开的文档是
+    // 「每次调用 push 一条新引用 + 各自 3 分钟 TTL」，并在引用数达 60 时批量 dispose 最老的 10 条。
+    // 每 dispose 一条就会触发 onDidCloseTextDocument，而 TS 扩展的 closeResource 里
+    // `if (wasBufferOpen) this.requestAllDiagnostics()` 会让所有已打开文件重跑诊断。
+    // 于是「context 里跳几次→ 引用堆积 → 批量关闭 → 连环全量诊断」把单线程语言服务器占满，
+    // 而vscode.executeDefinitionProvider 内部硬编码 CancellationToken.None、无法取消也无法插队，
+    // 只能干等前面的活干完 —— 这正是"跳一圈回来再点原token 要 2.4s"的根因。
+    // 复用已有文档可避免同一文件反复累积引用，是减少这类风暴最直接的一招。
+    private async acquireDocument(uri: vscode.Uri): Promise<vscode.TextDocument> {
+        const key = uri.toString();
+        const existing = vscode.workspace.textDocuments.find(d => !d.isClosed && d.uri.toString() === key);
+        // console.log(`acquireDocument: ${key}, existing: ${existing}`);
+        return existing ?? await vscode.workspace.openTextDocument(uri);
+    }
+
     /**
      * 统一的内容加载逻辑：打开文档 → 查缓存 → 判定大文件 → 入缓存。
      * 是 getFileContents 与 getContentByUri 的公共底座，避免两处流程重复、行为漂移。
@@ -150,7 +195,7 @@ export class Renderer {
      */
     private async loadContent(uri: vscode.Uri, fallbackLanguageId?: string): Promise<LoadedContent> {
         const cacheKey = uri.toString();
-        const doc = await vscode.workspace.openTextDocument(uri);
+        const doc = await this.acquireDocument(uri);
         const currentVersion = doc.version;
         // 仅在非默认 tokenizer 模式（useDefaultTokenizer 关闭）下才向语言服务器索取语义 token：
         // 此时基础语法层由真实 TextMate 接管、语义层叠加其上。默认模式纯用 Monaco 内置 tokenizer，无需多一次较贵的语义请求。
@@ -166,25 +211,36 @@ export class Renderer {
         if (cached && cached.documentVersion === currentVersion) {
             this._fileCache.delete(cacheKey);
             this._fileCache.set(cacheKey, cached);
-            // 缓存项可能在"默认模式"时写入而未带语义 token，按需补取并回填
-            let semantic = cached.semantic;
-            if (needSemantic && semantic === undefined) {
-                semantic = await this.getSemanticTokens(uri);
-                cached.semantic = semantic;
+            // 对齐 VSCode：内容加载阶段不阻塞取整篇 data，只取（或复用）legend 随内容下发；
+            // data 交由上层 fetchSemanticForUri 异步补取，避免拖慢首屏内容返回。
+            let legend = cached.legend;
+            if (needSemantic && legend === undefined) {
+                legend = await this.getLegendTokens(doc);
+                cached.legend = legend;
             }
             return {
                 content: cached.content,
                 languageId: cached.languageId,
                 documentVersion: currentVersion,
                 lineCount: doc.lineCount,
-                semantic: needSemantic ? semantic : null
+                // 已缓存到的 data 直接带出（命中即用）；未取过则为 undefined，交由上层异步补取
+                semantic: needSemantic ? cached.semantic : null,
+                legend: needSemantic ? (legend ?? null) : null
             };
         }
 
         const fileExtension = uri.fsPath.toLowerCase().split('.').pop();
         const finalLanguageId = fileExtension === 'inc' ? 'cpp' : (doc.languageId || fallbackLanguageId || 'plaintext');
         const content = this.readFullFileContent(doc);
-        const semantic = needSemantic ? await this.getSemanticTokens(uri) : null;
+        // 语义 token 三态：
+        //   undefined —— 本次未向语言服务器索取整篇 data（内容优先返回，data 交上层异步补取；
+        //                默认 tokenizer 模式 / 该语言关闭语义高亮时也是 undefined）；
+        //   null      —— 索取过但确认为空（未装语言扩展 / 不支持语义 token / 无 token），不必重取；
+        //   Payload   —— 索取到数据。
+        // 对齐 VSCode：这里不再 `await getSemanticTokens`（整篇 data 慢），让内容立即返回、TextMate 先着色；
+        // 只取「legend」（快）随内容下发，供前端首帧建 styling；data 由上层 fetchSemanticForUri 异步补取。
+        const semantic = undefined;
+        const legend = needSemantic ? await this.getLegendTokens(doc) : undefined;
 
         // 按内容字节大小判定是否为大文件（content 已无条件读取，零额外开销）
         if (content.length > this.largeFileSizeThreshold) {
@@ -192,7 +248,8 @@ export class Renderer {
                 content,
                 languageId: finalLanguageId,
                 documentVersion: currentVersion,
-                semantic
+                semantic,
+                legend
             });
         }
 
@@ -201,8 +258,76 @@ export class Renderer {
             languageId: finalLanguageId,
             documentVersion: currentVersion,
             lineCount: doc.lineCount,
-            semantic
+            semantic,
+            legend: legend ?? null
         };
+    }
+
+    /**
+     * 轻量获取「仅 legend」（tokenTypes / tokenModifiers 索引表），不取整篇 data。
+     * 对齐 VSCode 架构：provider 注册时 legend 即已知、data 才异步流入。
+     * legend 只由 `provideDocumentSemanticTokensLegend` 得到，成本远低于取整篇 data（不跑整篇语义分析），
+     * 因此可在「内容下发阶段」随内容一起下发，使前端首帧就用完整 legend 建 styling。
+     * 未装语言扩展 / 不支持语义 token →返回 null，前端保持 TextMate 着色。
+     */
+    private async getLegendTokens(doc: vscode.TextDocument): Promise<SemanticLegend | null> {
+        try {
+            const legend = await vscode.commands.executeCommand<vscode.SemanticTokensLegend>(
+                'vscode.provideDocumentSemanticTokensLegend', doc.uri);
+            if (!legend || !legend.tokenTypes || legend.tokenTypes.length === 0) {
+                return null;
+            }
+            return {
+                tokenTypes: Array.from(legend.tokenTypes),
+                tokenModifiers: Array.from(legend.tokenModifiers || [])
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * 供上层异步补取整篇语义 token（对齐 VSCode ModelSemanticColoring：内容先渲染、data 稍后覆盖）。
+     * 内部做 needSemantic 判定与缓存回填；返回 null 表示无需/无semantic（前端保持 TextMate 着色）。
+     * 注意：不阻塞内容加载，由 contextView 在内容下发后带 debounce 调用。
+     */
+    public async fetchSemanticForUri(uri: vscode.Uri): Promise<SemanticPayload | null> {
+        const doc = await this.acquireDocument(uri);
+        const needSemantic = !vscode.workspace
+            .getConfiguration('contextView.contextWindow')
+            .get<boolean>('useDefaultTokenizer', true)
+            && this.isSemanticHighlightingEnabled(doc);
+        if (!needSemantic) {
+            return null;
+        }
+
+        const cacheKey = uri.toString();
+        const cached = this._fileCache.get(cacheKey);
+        // 缓存里已取过整篇 data（含 null）且版本一致：直接用，避免重复请求语言服务器
+        if (cached && cached.documentVersion === doc.version && cached.semantic !== undefined) {
+            return cached.semantic;
+        }
+
+        const semantic = await this.getSemanticTokens(doc);
+        // 回填缓存。注意必须重新 get：上面的 await 期间事件循环可能已改动缓存
+        //（其他跳转 addToCache 新增此条目、LRU 淘汰旧条目、或新版本覆盖），
+        // 前面的 cached 是await 之前的快照，可能已失效/为undefined，不能直接复用。
+        // 仅当该 key 当前确实在缓存中且版本仍一致时才回填，避免写进孤儿对象或污染新版本。
+        const latest = this._fileCache.get(cacheKey);
+        if (latest && latest.documentVersion === doc.version) {
+            latest.semantic = semantic;
+            // data 里也带着权威legend，一并回填，之后命中直接复用
+            if (semantic && semantic.legend) {
+                latest.legend = semantic.legend;
+            }
+        }
+        return semantic;
+    }
+
+    /** 供上层做版本校验：拿当前文档版本（对齐 VSCode getVersionId 的过期丢弃） */
+    public async getDocumentVersion(uri: vscode.Uri): Promise<number> {
+        const doc = await this.acquireDocument(uri);
+        return doc.version;
     }
 
     /**
@@ -210,37 +335,58 @@ export class Renderer {
      * 拿到的就是当前语言服务器（cpptools/gopls/TS 等）产出的语义分类。
      * 与编辑器显示的是整文档坐标，前端 Monaco 显示也是整文档，坐标天然一一对应。
      * 任意失败（未装语言扩展 / 不支持语义 token / 文档未纳入分析）均返回 null，前端回退到基础着色。
+     * 保留 mod 的 200ms 预算兜底：即使语言服务器响应慢，也会在预算耗尽后放弃并返回 null，
+     * 避免长时间占用语言服务器（vscode.executeDefinitionProvider 内部不可取消）。
      */
-    private async getSemanticTokens(uri: vscode.Uri): Promise<SemanticPayload | null> {
+    private async getSemanticTokens(doc: vscode.TextDocument): Promise<SemanticPayload | null> {
+        let expired = false;
+        let timer: NodeJS.Timeout | undefined;
+        const uri = doc.uri;
+        const request = (async (): Promise<SemanticPayload | null> => {
+            try {
+                const legend = await this.getLegendTokens(doc);
+                if (expired || !legend) {
+                    return null;
+                }
+                // 1) 先试整文档（< 10 万字符的文件 TS 等语言服务直接给）
+                const full = await vscode.commands.executeCommand<vscode.SemanticTokens>(
+                    'vscode.provideDocumentSemanticTokens', uri);
+                if (expired) {
+                    return null;
+                }
+                let data: number[] | null =
+                    (full && full.data && full.data.length) ? Array.from(full.data) : null;
+
+                // 2) 整文档为空（大文件被 TS 的 100000 字符上限拒绝）→ 按行分段用 range provider 拼接
+                if (!data && !expired) {
+                    data = await this.collectRangeTokensByChunks(doc);
+                }
+                if (expired || !data || data.length === 0) {
+                    return null;
+                }
+
+                return {
+                    legend,
+                    data
+                };
+            } catch {
+                return null;
+            }
+        })();
+
+        const budget = new Promise<null>(resolve => {
+            timer = setTimeout(() => {
+                expired = true;
+                resolve(null);
+            }, SEMANTIC_TOKEN_BUDGET_MS);
+        });
+
         try {
-            const legend = await vscode.commands.executeCommand<vscode.SemanticTokensLegend>(
-                'vscode.provideDocumentSemanticTokensLegend', uri);
-            if (!legend || !legend.tokenTypes) {
-                return null;
+            return await Promise.race([request, budget]);
+        } finally {
+            if (timer) {
+                clearTimeout(timer);
             }
-            // 1) 先试整文档（< 10 万字符的文件 TS 等语言服务直接给）
-            const full = await vscode.commands.executeCommand<vscode.SemanticTokens>(
-                'vscode.provideDocumentSemanticTokens', uri);
-            let data: number[] | null =
-                (full && full.data && full.data.length) ? Array.from(full.data) : null;
-
-            // 2) 整文档为空（大文件被 TS 的 100000 字符上限拒绝）→ 按行分段用 range provider 拼接
-            if (!data) {
-                data = await this.collectRangeTokensByChunks(uri);
-            }
-            if (!data || data.length === 0) {
-                return null;
-            }
-
-            return {
-                legend: {
-                    tokenTypes: Array.from(legend.tokenTypes),
-                    tokenModifiers: Array.from(legend.tokenModifiers || [])
-                },
-                data
-            };
-        } catch {
-            return null;
         }
     }
 
@@ -250,9 +396,11 @@ export class Renderer {
      * 故按行边界切成多段（每段 < 上限）逐段取 range 语义 token，解码为文档绝对坐标后合并，
      * 再重新编码为一份完整的、从文档 (0,0) 起的 delta 序列。前端解码逻辑无需改动。
      */
-    private async collectRangeTokensByChunks(uri: vscode.Uri): Promise<number[] | null> {
+    private async collectRangeTokensByChunks(doc: vscode.TextDocument): Promise<number[] | null> {
         const LIMIT = 90000; // 留余量，低于 TS 硬编码的 100000
-        const doc = await vscode.workspace.openTextDocument(uri);
+        // 文档由上层（loadContent → acquireDocument）传入复用，此处不再 openTextDocument，
+        // 避免同一文件在一次渲染里被重复 push 到主线程的 model 引用集合。
+        const uri = doc.uri;
 
         // 按行切分（token 不跨行，行边界切不截断、段间不重叠）
         const ranges: vscode.Range[] = [];

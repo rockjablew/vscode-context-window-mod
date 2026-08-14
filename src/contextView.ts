@@ -13,7 +13,11 @@ const INITIAL_UPDATE_DELAY = 2000; // 初始化后保底更新延时（ms）
 
 interface HistoryInfo {
     content: FileContentInfo | undefined;
+    // 「返回该条时光标应落回的位置」，均为 0-based，-1 表示未知。
+    // navigateLine 由来源侧写入（离开该段时点击的行）；navigateColumn 是同一次点击的列，
+    // 有了列才能精确回到当初点出去的那个 token，否则前端只能退回行尾。
     navigateLine: number;
+    navigateColumn: number;
 }
 
 export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode.WebviewPanelSerializer {
@@ -34,6 +38,7 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
 
     private currentUri: vscode.Uri | undefined = undefined;
     private currentLine: number = 0; // 添加行号存储
+    private currentColumn: number = 0; // 与 currentLine 配对的列号（0-based）
     public static readonly viewType = 'contextView.context';
 
     private static readonly pinnedContext = 'contextView.contextWindow.isPinned';
@@ -45,6 +50,7 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
     private _view?: vscode.WebviewView;
     private _currentCacheKey: CacheKey = cacheKeyNone;
     private _loading?: { cts: vscode.CancellationTokenSource }
+    private _definitionRequest?: { cts: vscode.CancellationTokenSource }
 
     private _updateMode = UpdateMode.Sticky;
     private _pinned = false;
@@ -60,6 +66,15 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
     private _lastContent: FileContentInfo | undefined;  // 最近一次的内容
 
     private _progressDepth = 0;  // 进度条嵌套计数：归零才隐藏，避免并发更新时进度条错配
+
+    // —— 对齐 VSCode ModelSemanticColoring 的 semantic 异步补取（内容先出、data 后覆盖）——
+    // 内容下发后不阻塞，延迟(debounce)向语言服务器取整篇 semantic data，取到再单独postMessage 下发。
+    private _semanticTimer: NodeJS.Timeout | null = null;
+    private _semanticCts?: vscode.CancellationTokenSource;
+    // 自适应 debounce：对齐 VSCode 的 min 300 / max 2000 + SlidingWindowAverage(6)。
+    private _semanticDelays: number[] = [];
+    private static readonly SEMANTIC_MIN_DELAY = 300;
+    private static readonly SEMANTIC_MAX_DELAY = 2000;
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -83,10 +98,14 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
                         type: 'updateEditorConfiguration',
                         configuration: updatedConfig
                     });
-                // 指令高亮（#include 等）的配色来自 editor.tokenColorCustomizations、字重来自 editor.fontWeight，
-                // 这两类变更时同步最新 contextEditorCfg，使 webview 内的指令着色与 VSCode 保持一致。
+                // 指令高亮（#include 等）的配色/字重，或括号对着色开关变化时，同步最新 contextEditorCfg，
+                // 使 webview 内的对应样式与 VSCode 保持一致。
                 if (e.affectsConfiguration('editor.tokenColorCustomizations') ||
-                    e.affectsConfiguration('editor.fontWeight')) {
+                    e.affectsConfiguration('editor.fontWeight') ||
+                    e.affectsConfiguration('editor.bracketPairColorization.enabled') ||
+                    // 主编辑器 sticky scroll 开关变化时，若本插件未显式设置（跟随模式），
+                    // 需回推最新有效值刷新 webview 的粘附行显示。
+                    e.affectsConfiguration('editor.stickyScroll.enabled')) {
                     this.postMessageToWebview({
                         type: 'updateContextEditorCfg',
                         contextEditorCfg: updatedConfig.contextEditorCfg,
@@ -247,17 +266,21 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
     }
 
     private getCurrentContent() : HistoryInfo {
-        return (this._history && this._history.length > this._historyIndex) ? this._history[this._historyIndex] : { content: undefined, navigateLine: -1 };
+        return (this._history && this._history.length > this._historyIndex) ? this._history[this._historyIndex] : { content: undefined, navigateLine: -1, navigateColumn: -1 };
     }
 
-    private addToHistory(contentInfo: FileContentInfo, fromLine: number =-1) {
-        //console.log('[definition] add history from line', fromLine);
+    // fromLine / fromColumn：离开「当前这一条」时用户点击的位置（0-based），写回旧的当前条，
+    // 返回时据此把光标精确放回当初点出去的那个 token 上。只有行没有列时前端只能退到行尾，
+    // 光标会落在无关标识符上（Monaco 的同词高亮跟着跑偏）。
+    private addToHistory(contentInfo: FileContentInfo, fromLine: number =-1, fromColumn: number =-1) {
+        //console.log('[definition] add history from line', fromLine, 'column', fromColumn);
         // 清除_historyIndex后的内容
         this._history = this._history.slice(0, this._historyIndex + 1);
-        this._history.push({ content: contentInfo, navigateLine: -1 });
+        this._history.push({ content: contentInfo, navigateLine: -1, navigateColumn: -1 });
         this._historyIndex++;
 
         this._history[this._historyIndex-1].navigateLine = fromLine;
+        this._history[this._historyIndex-1].navigateColumn = fromColumn;
 
         // this._history.forEach(element => {
         //     console.log('[definition] history element', element);
@@ -350,6 +373,34 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
             .get<boolean>('useDefaultTokenizer', true);
     }
 
+    // 解析 Sticky Scroll 的有效开关值（三态 → 布尔）。
+    //插件自身配置 contextView.contextWindow.stickyScroll：
+    //   · 未设置（null / undefined）→ 跟随主编辑器 editor.stickyScroll.enabled（保持与VSCode 同步）；
+    //   · 显式 true/false → 以插件设置为准（右键菜单切换会写入此项，从而覆盖 VSCode 全局值）。
+    private _resolveStickyScrollEnabled(
+        contextWindowConfig: vscode.WorkspaceConfiguration,
+        editorConfig: vscode.WorkspaceConfiguration
+    ): boolean {
+        const own = contextWindowConfig.get<boolean | null>('stickyScroll', null);
+        if (typeof own === 'boolean') {
+            return own;
+        }
+        // 未设置：跟随主编辑器全局开关（VSCode 默认 true）。
+        return editorConfig.get<boolean>('stickyScroll.enabled', true);
+    }
+
+    // 持久化 Sticky Scroll 开关：右键菜单切换时由webview 发来，写入插件自身配置（覆盖跟随 VSCode 的默认行为）。
+    // 写入后 onDidChangeConfiguration 回调会通过 updateContextEditorCfg 把最新有效值广播回 webview。
+    private async handleSetStickyScroll(message: any) {
+        try {
+            const value = !!message?.value;
+            const cfg = vscode.workspace.getConfiguration('contextView.contextWindow');
+            await cfg.update('stickyScroll', value, true);
+        } catch (err) {
+            console.error('[context-window] setStickyScroll failed:', err);
+        }
+    }
+
     // 从 editor.tokenColorCustomizations 读取 #include 等预处理指令的前景色。
     // 与扩展端 VSCode 装饰（registerDirectiveDecorations）取色保持一致，使 webview Monaco 高亮同源。
     private _readDirectiveColor(): string {
@@ -397,6 +448,8 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
                 fontFamily: contextWindowConfig.get('fontFamily', 'Consolas, monospace'),
                 minimap: contextWindowConfig.get('minimap', true),
                 useDefaultTokenizer: contextWindowConfig.get('useDefaultTokenizer', true),
+                // VSCode 的括号对着色开关：下发给 webview，使 Monaco 括号对着色行为与 VSCode 一致。
+                bracketPairColorization: editorConfig.get<boolean>('bracketPairColorization.enabled', true),
                 cacheSizeLimit: contextWindowConfig.get('cacheSizeLimit', 30),
                 fixStickyScroll: contextWindowConfig.get('fixStickyScroll', false),
                 // 是否启用自定义 hover 提示（右键菜单可切换，默认 false）。
@@ -408,6 +461,15 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
                 directiveColor: this._readDirectiveColor(),
                 // 「双击选中整对括号/引号（含定界符）」开关：下发给 webview，用于底部导航栏 {si} 指示器的开/关显示。
                 doubleClickSelectsBracketPair: contextWindowConfig.get('doubleClickSelectsBracketPair', false),
+                // Monaco 内置「光标处同词高亮」开关，默认关。本面板的光标是程序设置的（跳转/返回定位），
+                // 而该高亮只认光标所在的词，差一列就框到旁边的无关标识符上。
+                occurrencesHighlight: contextWindowConfig.get('occurrencesHighlight', false),
+                // Sticky Scroll（顶部粘附的函数/类标题行）是否显示的「有效值」。
+                // 本插件配置 contextView.contextWindow.stickyScroll 为三态：
+                //   · null（默认，未设置）→ 跟随主编辑器 editor.stickyScroll.enabled；
+                //   · true/false → 以插件自身设置为准（右键菜单切换即写入此项，从而覆盖 VSCode 全局值）。
+                // 后端在此把三态解析成一个明确的布尔值下发，前端启动/运行期据此设置 Monaco 的 stickyScroll.enabled。
+                stickyScroll: this._resolveStickyScrollEnabled(contextWindowConfig, editorConfig),
             }
         };
 
@@ -450,6 +512,18 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
             try { this._loading.cts.cancel(); } catch (_) { /* noop */ }
             try { this._loading.cts.dispose(); } catch (_) { /* noop */ }
             this._loading = undefined;
+        }
+        this.cancelDefinitionRequest();
+
+        // 清理 semantic 异步补取的定时器与进行中的请求，避免 dispose 后回调到已释放对象
+        if (this._semanticTimer) {
+            clearTimeout(this._semanticTimer);
+            this._semanticTimer = null;
+        }
+        if (this._semanticCts) {
+            try { this._semanticCts.cancel(); } catch (_) { /* noop */ }
+            try { this._semanticCts.dispose(); } catch (_) { /* noop */ }
+            this._semanticCts = undefined;
         }
 
         // 确保关闭定义选择面板
@@ -496,8 +570,21 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
                 });
             
             const contentInfo = this._history[this._historyIndex];
-            this.updateContent(contentInfo?.content, contentInfo.navigateLine);
+            this.updateContent(contentInfo?.content, contentInfo.navigateLine, contentInfo.navigateColumn);
+            // 历史导航后展示的已不是「主编辑区当前光标处」的上下文，缓存键必须失效，
+            // 否则再点主编辑区那个原 token 会被 update() 的同键判定挡掉（见 invalidateCacheKey 说明）
+            this.invalidateCacheKey();
         }
+    }
+
+    // 让 update() 的缓存键失效。
+    // _currentCacheKey 记录的是「webview 当前展示的内容对应主编辑区的哪个位置(uri+版本+词范围)」，
+    // update() 靠它跳过重复计算。但 webview 内部的跳转 / 定义列表选择 / 历史前进后退都会把展示内容
+    // 换成别处，而主编辑区光标并没有动 —— 此时缓存键仍是旧 token 的键，与实际展示内容已经不符。
+    // 用户再点主编辑区那个原 token（uri、文档版本、词范围都没变）就会命中同键判定被直接 return，
+    // 表现为「点了没反应」。所以凡是在插件内单方面改过展示内容，都要把键置空，让下一次 update 必定重算。
+    private invalidateCacheKey() {
+        this._currentCacheKey = cacheKeyNone;
     }
 
     public showFloatingWebview() {
@@ -739,7 +826,12 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
         try {
             const contentInfo = await this._renderer.renderDefinition(languageId, definition);
             this.updateContent(contentInfo);
-            this.addToHistory(contentInfo, range.start.line);
+            
+            // 使用range的起始位置作为导航坐标用于历史记录（入参 range 是 1-based，历史里统一存 0-based）
+            this.addToHistory(contentInfo, range.start.line - 1, range.start.character - 1);
+
+            // 同 handleJumpDefinition：命令式跳转同样只改了展示内容，主编辑区光标没动，缓存键需失效
+            this.invalidateCacheKey();
         } catch (error) {
             const message = error instanceof Error ? error.message : 'Unknown error';
             vscode.window.showErrorMessage(`File not found or not accessible: ${targetUri.fsPath || uri} (${message})`);
@@ -777,17 +869,24 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
                 case 'requestContent':
                     this.handleRequestContent(message);
                     break;
+                case 'requestSemantic':
+                    // 前端命中缓存直接渲染（不走 requestContent）但尚无 data时，主动来要一次。
+                    this.handleRequestSemantic(message);
+                    break;
                 case 'requestGrammar':
                     this.handleRequestGrammar(message);
                     break;
                 case 'jumpDefinition':
-                    this.handleJumpDefinition(message, editor);
+                    this.handleJumpDefinition(message);
                     break;
                 case 'requestHover':
                     this.handleRequestHover(message);
                     break;
                 case 'setEnableHover':
                     await this.handleSetEnableHover(message);
+                    break;
+                case 'setStickyScroll':
+                    await this.handleSetStickyScroll(message);
                     break;
                 case 'toggleSelectBracketPair':
                     // 底部导航栏 {si} 指示器点击：切换「双击选中整对括号/引号」开关。
@@ -803,6 +902,14 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
                 case 'closeDefinitionList':
                     this.postMessageToWebview({ type: 'clearDefinitionList' });
                     break;
+                case 'copyToClipboard':
+                    // 粘附行(sticky scroll)区域的选中内容不占用 Monaco 的 model 选区，
+                    // 故 Monaco 自带的复制命令拿不到它；而 webview 内的 navigator.clipboard
+                    // 受焦点/权限限制经常静默失败，因此统一交给扩展端用 VSCode 官方 API 写入。
+                    if (typeof message.text === 'string' && message.text.length > 0) {
+                        await vscode.env.clipboard.writeText(message.text);
+                    }
+                    break;
             }
         });
     }
@@ -813,8 +920,9 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
      * @param curLine      1-based 当前行（-1 表示无）
      * @param includeRange 是否附带 range（updateContent 场景需要）
      * @param target       指定目标 webview；不传则广播到 view + panel
+     * @param curColumn    1-based 当前列（-1 表示无，前端退回行尾）
      */
-    private postMetadata(content: FileContentInfo, curLine: number, includeRange: boolean, target?: vscode.Webview) {
+    private postMetadata(content: FileContentInfo, curLine: number, includeRange: boolean, target?: vscode.Webview, curColumn: number = -1) {
         const uri = content.jmpUri.toString();
         const currentVersion = content.documentVersion;
         const msg: any = {
@@ -824,6 +932,7 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
             languageId: content.languageId,
             updateMode: this._updateMode,
             curLine,
+            curColumn,
             documentVersion: currentVersion
         };
         if (includeRange) {
@@ -879,14 +988,16 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
                 // 取色弹窗的 <input type=color> 返回 "#rrggbb"，这里统一去掉前导 '#' 再持久化，避免渲染时颜色被丢弃。
                 patch.foreground = message.newStyle.foreground.trim().replace(/^#/, '');
             }
-            if (message.newStyle && (message.newStyle.bold || message.newStyle.italic)) {
-                if (message.newStyle.bold && message.newStyle.italic) {
-                    patch.fontStyle = "bold italic";
-                } else if (message.newStyle.bold) {
-                    patch.fontStyle = "bold";
-                } else if (message.newStyle.italic) {
-                    patch.fontStyle = "italic";
-                }
+            if (message.newStyle) {
+                // 始终按取色面板两个复选框「显式」写入 fontStyle（含都不勾时写空串 ""）。
+                // 关键：空串 = 显式「无粗体/斜体」，会覆盖主题默认样式；若像旧逻辑那样「都不勾就不写」，
+                // upsertRule 会删除 fontStyle 字段，token 便回退继承主题默认字体样式——如语义 token
+                // method.declaration.async 会继承 *.declaration 默认的 bold，表现为「去掉 italic 后 bold 又冒出来」。
+                // 显式写入后，复选框状态 === 存储 === 渲染，彻底消除样式泄漏与不一致。
+                const parts: string[] = [];
+                if (message.newStyle.bold) { parts.push('bold'); }
+                if (message.newStyle.italic) { parts.push('italic'); }
+                patch.fontStyle = parts.join(' ');
             }
             if (!token) {
                 throw new Error('token is required');
@@ -927,7 +1038,7 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
         const curContext = this.getCurrentContent();
         if (curContext?.content) {
             // 恢复时携带 range，确保面板重新就绪后能滚动并高亮到定义行
-            this.postMetadata(curContext.content, curContext.navigateLine + 1, true, this._currentPanel.webview);
+            this.postMetadata(curContext.content, curContext.navigateLine + 1, true, this._currentPanel.webview, curContext.navigateColumn + 1);
         }
         this.postMessageToWebview({
             type: 'pinState',
@@ -950,6 +1061,8 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
     // WebView 请求完整内容（优先命中最近一次的单槽缓存，未命中则按 uri 现取）
     private handleRequestContent(message: any) {
         if (message.contentHash && message.contentHash === this._lastContentHash && this._lastContent) {
+            const hitUri = vscode.Uri.parse(this._lastContent.jmpUri.toString());
+            const hitVersion = this._lastContent.documentVersion;
             this.postMessageToWebview({
                 type: 'updateContent',
                 contentHash: this._lastContentHash,
@@ -958,10 +1071,14 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
                 languageId: this._lastContent.languageId,
                 updateMode: this._updateMode,
                 range: this._lastContent.range,
-                documentVersion: this._lastContent.documentVersion,
+                documentVersion: hitVersion,
                 lineCount: this._lastContent.lineCount,
-                semantic: this._lastContent.semantic ?? null
+                // 对齐 VSCode：内容阶段带 legend（快、供首帧建 styling），不带 data（TextMate 先着色）
+                semantic: null,
+                legend: this._lastContent.legend ?? null
             });
+            // 内容已下发，异步补 semantic data（带 debounce + 版本校验），取到后单独覆盖
+            this.scheduleSemanticUpdate(hitUri, hitVersion);
             return;
         }
 
@@ -981,9 +1098,13 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
                     updateMode: this._updateMode,
                     documentVersion: info.documentVersion,
                     lineCount: info.lineCount,
-                    semantic: info.semantic ?? null
+                    // 对齐 VSCode：内容阶段带 legend（快、供首帧建 styling），不带 data（TextMate 先着色）
+                    semantic: null,
+                    legend: info.legend ?? null
                     // 不回传 range/curLine：前端用 updateMetadata 阶段保存的定位信息
                 });
+                // 内容已下发，异步补 semantic data（带 debounce + 版本校验），取到后单独覆盖
+                this.scheduleSemanticUpdate(reqUri, info.documentVersion);
             } catch (e) {
                 this.postMessageToWebview({
                     type: 'contentError',
@@ -993,6 +1114,84 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
                 });
             }
         })();
+    }
+
+    // 前端命中缓存直接渲染时（不经 requestContent），若本地无 data 则发此消息补取。
+    // 复用 scheduleSemanticUpdate 的 debounce + 版本校验，取到后以 updateSemantic 单独下发。
+    private handleRequestSemantic(message: any) {
+        if (!message?.uri) {
+            return;
+        }
+        try {
+            const reqUri = vscode.Uri.parse(message.uri);
+            const version = typeof message.documentVersion === 'number' ? message.documentVersion : 0;
+            this.scheduleSemanticUpdate(reqUri, version);
+        } catch {
+            // uri 解析失败：静默忽略，前端保持 TextMate 着色
+        }
+    }
+
+    // 自适应 debounce 延迟：对齐 VSCode的 min/max + 最近 N 次耗时滑动平均。
+    private currentSemanticDelay(): number {
+        if (this._semanticDelays.length === 0) {
+            return ContextWindowProvider.SEMANTIC_MIN_DELAY;
+        }
+        const avg = this._semanticDelays.reduce((a, b) => a + b, 0) / this._semanticDelays.length;
+        return Math.max(
+            ContextWindowProvider.SEMANTIC_MIN_DELAY,
+            Math.min(ContextWindowProvider.SEMANTIC_MAX_DELAY, avg)
+        );
+    }
+
+    /**
+     * 对齐 VSCode ModelSemanticColoring：内容渲染后，延迟(debounce)异步取整篇 semantic data 再单独下发。
+     * - 每次调用取消上一轮定时器与请求（RunOnceScheduler 语义），避免快速跳转时请求堆积；
+     * - 带 documentVersion 版本校验，等待期间文档若已变/切走则丢弃结果（对齐 getVersionId 过期丢弃）；
+     * - 记录请求耗时更新滑动平均，驱动自适应 debounce。
+     */
+    private scheduleSemanticUpdate(uri: vscode.Uri, documentVersion: number) {
+        // 取消上一轮（定时器 + 进行中的请求）
+        if (this._semanticTimer) {
+            clearTimeout(this._semanticTimer);
+            this._semanticTimer = null;
+        }
+        this._semanticCts?.cancel();
+
+        const delay = this.currentSemanticDelay();
+        this._semanticTimer = setTimeout(async () => {
+            this._semanticTimer = null;
+            const cts = new vscode.CancellationTokenSource();
+            this._semanticCts = cts;
+            const start = Date.now();
+            try {
+                const semantic = await this._renderer.fetchSemanticForUri(uri);
+
+                // 更新滑动平均（保留最近 6 次，与 VSCode SlidingWindowAverage(6) 一致）
+                const elapsed = Date.now() - start;
+                this._semanticDelays.push(elapsed);
+                if (this._semanticDelays.length > 6) {
+                    this._semanticDelays.shift();
+                }
+
+                if (cts.token.isCancellationRequested) {
+                    return;
+                }
+                // 版本校验：等待期间文档可能被编辑或已切换到别的文件
+                const nowVersion = await this._renderer.getDocumentVersion(uri);
+                if (nowVersion !== documentVersion) {
+                    return;
+                }
+
+                this.postMessageToWebview({
+                    type: 'updateSemantic',
+                    uri: uri.toString(),
+                    documentVersion,
+                    semantic: semantic ?? null
+                });
+            } catch {
+                // 静默：取不到 semantic 时前端保持 TextMate 着色
+            }
+        }, delay);
     }
 
     // Webview hover：转发到主编辑区已就绪的 LSP（vscode.executeHoverProvider），
@@ -1097,46 +1296,192 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
         }
     }
 
-    // 点击符号：查找定义并渲染
-    private handleJumpDefinition(message: any, editor: vscode.TextEditor | undefined) {
-        if (!editor || !(message.uri?.length > 0)) {
+    private cancelDefinitionRequest(): void {
+        const request = this._definitionRequest;
+        if (!request) {
             return;
         }
 
+        this._definitionRequest = undefined;
+        try { request.cts.cancel(); } catch (_) { /* noop */ }
+        try { request.cts.dispose(); } catch (_) { /* noop */ }
+    }
+
+    private cancelActiveEditorLoading(): void {
+        const loading = this._loading;
+        if (!loading) {
+            return;
+        }
+
+        this._loading = undefined;
+        try { loading.cts.cancel(); } catch (_) { /* noop */ }
+        try { loading.cts.dispose(); } catch (_) { /* noop */ }
+    }
+
+    private beginDefinitionRequest(): { cts: vscode.CancellationTokenSource } {
+        this.cancelDefinitionRequest();
+        this.cancelActiveEditorLoading();
+
+        const request = { cts: new vscode.CancellationTokenSource() };
+        this._definitionRequest = request;
+        return request;
+    }
+
+    private isCurrentDefinitionRequest(request: { cts: vscode.CancellationTokenSource }): boolean {
+        return this._definitionRequest === request && !request.cts.token.isCancellationRequested;
+    }
+
+    private finishDefinitionRequest(request: { cts: vscode.CancellationTokenSource }): void {
+        if (this._definitionRequest !== request) {
+            return;
+        }
+
+        this._definitionRequest = undefined;
+        request.cts.dispose();
+    }
+
+    private getDefinitionLookupPosition(
+        document: vscode.TextDocument,
+        requestedPosition: vscode.Position,
+        token: string
+    ): vscode.Position {
+        const line = Math.max(0, Math.min(requestedPosition.line, document.lineCount - 1));
+        const lineText = document.lineAt(line).text;
+        const character = Math.max(0, Math.min(requestedPosition.character, lineText.length));
+        const positionInRange = (start: number, end: number) =>
+            new vscode.Position(line, Math.max(start, Math.min(character, end - 1)));
+
+        const symbol = token.trim();
+        if (symbol && !symbol.includes('\n') && !symbol.includes('\r')) {
+            let nearestStart = -1;
+            let nearestDistance = Number.MAX_SAFE_INTEGER;
+            let searchFrom = 0;
+            while (searchFrom <= lineText.length - symbol.length) {
+                const start = lineText.indexOf(symbol, searchFrom);
+                if (start < 0) {
+                    break;
+                }
+                const end = start + symbol.length;
+                const distance = character < start
+                    ? start - character
+                    : (character >= end ? character - end + 1 : 0);
+                if (distance < nearestDistance) {
+                    nearestStart = start;
+                    nearestDistance = distance;
+                }
+                searchFrom = start + Math.max(1, symbol.length);
+            }
+            if (nearestStart >= 0) {
+                return positionInRange(nearestStart, nearestStart + symbol.length);
+            }
+        }
+
+        let wordRange = document.getWordRangeAtPosition(new vscode.Position(line, character));
+        if (!wordRange && character > 0) {
+            wordRange = document.getWordRangeAtPosition(new vscode.Position(line, character - 1));
+        }
+        if (wordRange && wordRange.start.line === line && wordRange.end.line === line) {
+            return positionInRange(wordRange.start.character, wordRange.end.character);
+        }
+
+        return new vscode.Position(line, character);
+    }
+
+    private async findDefinitionsForClickedSymbol(
+        uri: vscode.Uri,
+        requestedPosition: vscode.Position,
+        token: string,
+        cancellationToken: vscode.CancellationToken
+    ): Promise<{ definitions: any[]; document: vscode.TextDocument; position: vscode.Position }> {
+        const document = await vscode.workspace.openTextDocument(uri);
+        const position = this.getDefinitionLookupPosition(document, requestedPosition, token);
+        if (cancellationToken.isCancellationRequested) {
+            return { definitions: [], document, position };
+        }
+        const definitions = await vscode.commands.executeCommand<any[]>(
+            'vscode.executeDefinitionProvider',
+            uri,
+            position
+        );
+        return {
+            definitions: cancellationToken.isCancellationRequested ? [] : (definitions || []),
+            document,
+            position
+        };
+    }
+
+    // VS Code cannot cancel an in-flight executeDefinitionProvider command, so a
+    // newer click cancels the local request and prevents stale results from rendering.
+    private handleJumpDefinition(message: any) {
+        if (!(message.uri?.length > 0)) {
+            return;
+        }
+
+        const request = this.beginDefinitionRequest();
         const updatePromise = (async () => {
-            const definitions = await vscode.commands.executeCommand<vscode.Location[]>(
-                'vscode.executeDefinitionProvider',
-                this.parseExternalUri(message.uri),
-                new vscode.Position(message.position.line, message.position.character)
-            );
-
-            if (definitions && definitions.length > 0) {
-                // 主动隐藏定义列表（在处理新的跳转前）
-                if (definitions.length === 1) {
-                    this.postMessageToWebview({ type: 'clearDefinitionList' });
+            let definitionFound = false;
+            try {
+                const sourceUri = this.parseExternalUri(message.uri);
+                const requestedPosition = new vscode.Position(message.position.line, message.position.character);
+                const result = await this.findDefinitionsForClickedSymbol(
+                    sourceUri,
+                    requestedPosition,
+                    String(message.token || ''),
+                    request.cts.token
+                );
+                if (!this.isCurrentDefinitionRequest(request)) {
+                    return;
                 }
 
-                let definition = definitions[0];
+                const definitions = result.definitions;
+                if (definitions.length > 0) {
+                    definitionFound = true;
+                    if (definitions.length === 1) {
+                        this.postMessageToWebview({ type: 'clearDefinitionList' });
+                    }
 
-                // 如果有多个定义，传递给 Monaco Editor
-                if (definitions.length > 1) {
-                    const currentPosition = new vscode.Position(message.position.line, message.position.character);
-                    definition = await this.showDefinitionPicker(definitions, editor, currentPosition);
+                    let definition = definitions[0];
+                    if (definitions.length > 1) {
+                        definition = await this.showDefinitionPicker(definitions, sourceUri, result.position);
+                    }
+                    if (!definition || !this.isCurrentDefinitionRequest(request)) {
+                        return;
+                    }
+
+                    const contentInfo = await this._renderer.renderDefinition(result.document.languageId, definition);
+                    if (!this.isCurrentDefinitionRequest(request)) {
+                        return;
+                    }
+                    this.updateContent(contentInfo);
+                    this.addToHistory(contentInfo, result.position.line);
+                } else {
+                    this.postMessageToWebview({
+                        type: 'noSymbolFound',
+                        pos: message.position,
+                        token: message.token
+                    });
                 }
-
-                const contentInfo = await this._renderer.renderDefinition(editor.document.languageId, definition);
-                this.updateContent(contentInfo);
-                this.addToHistory(contentInfo, message.position.line);
-            } else {
-                this.postMessageToWebview({
-                    type: 'noSymbolFound',
-                    pos: message.position,
-                    token: message.token
-                });
+                this.invalidateCacheKey();
+            } catch (error) {
+                if (this.isCurrentDefinitionRequest(request)) {
+                    if (definitionFound) {
+                        console.error('[context-window] Definition was found but could not be rendered:', error);
+                        vscode.window.showErrorMessage('Context Window: definition was found but could not be displayed.');
+                    } else {
+                        console.error('[context-window] Definition lookup failed:', error);
+                        this.postMessageToWebview({
+                            type: 'noSymbolFound',
+                            pos: message.position,
+                            token: message.token
+                        });
+                    }
+                }
+            } finally {
+                this.finishDefinitionRequest(request);
             }
         })();
 
-        this.withProgress<void>(() => updatePromise);
+        void this.withProgress<void>(() => updatePromise);
     }
 
     // 双击底部区域：在主编辑区打开当前上下文文件并跳转
@@ -1189,6 +1534,9 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
                 );
 
                 this.updateContent(contentInfo);
+
+                // 同 handleJumpDefinition：从多定义列表里选了另一条，展示内容已与主编辑区光标脱钩
+                this.invalidateCacheKey();
 
                 // 更新历史记录
                 if (this._history.length > this._historyIndex) {
@@ -1284,7 +1632,7 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
                 // 有缓存内容时立即恢复；没有则保持 Monaco "Ready for content." 状态，不主动查找定义
                 if (curContext?.content) {
                     // 恢复时携带 range，确保视图重新可见后能滚动并高亮到定义行
-                    this.postMetadata(curContext.content, curContext.navigateLine + 1, true, this._view.webview);
+                    this.postMetadata(curContext.content, curContext.navigateLine + 1, true, this._view.webview, curContext.navigateColumn + 1);
                 }
             }
         });
@@ -1300,7 +1648,7 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
         // 初始加载时如果有缓存内容就直接使用；否则保持 "Ready for content." 状态
         if (curContext?.content) {
             // 携带 range，确保初次加载缓存内容后能滚动并高亮到定义行
-            this.postMetadata(curContext.content, curContext.navigateLine + 1, true, this._view.webview);
+            this.postMetadata(curContext.content, curContext.navigateLine + 1, true, this._view.webview, curContext.navigateColumn + 1);
         }
 
         this._view.webview.postMessage({
@@ -1422,10 +1770,10 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
             <!-- 添加双击区域 -->
             <div class="double-click-area" title="double-click: Jump to definition">
                 <span class="filename-display">
-                    <span class="filename-text" title=""></span>
-                    <span class="filename-path" title="">
+                    <span class="filename-text"></span>
+                    <span class="filename-path">
                         <span class="filename-icon"></span>
-                        <span class="filename-path-text" title=""></span>
+                        <span class="filename-path-text"></span>
                     </span>
                 </span>
             </div>
@@ -1484,14 +1832,15 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
         </html>`;
     }
 
-    private async updateContent(contentInfo?: FileContentInfo, curLine: number =-1) {
+    private async updateContent(contentInfo?: FileContentInfo, curLine: number =-1, curColumn: number =-1) {
         if (contentInfo && contentInfo.content.length && contentInfo.jmpUri) {
             // 只缓存最近一次的内容（供前端请求使用）
             this._lastContentHash = `${contentInfo.jmpUri.toString()}:${contentInfo.documentVersion}`;
             this._lastContent = contentInfo;
 
             // 先发送元数据（不包含 body），body 由前端按需 requestContent 拉取
-            this.postMetadata(contentInfo, (curLine !== -1) ? curLine + 1 : -1, true);
+            // 历史里是 0-based，消息里统一转成 Monaco 的 1-based
+            this.postMetadata(contentInfo, (curLine !== -1) ? curLine + 1 : -1, true, undefined, (curColumn >= 0) ? curColumn + 1 : -1);
 
             if (this._currentPanel) {
                 let filePath;
@@ -1554,11 +1903,9 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
             return;
         }
 
-        // Cancel any existing loading
-        if (this._loading) {
-            this._loading.cts.cancel();
-            this._loading = undefined;
-        }
+        // A main-editor cursor update supersedes any pending webview symbol click.
+        this.cancelDefinitionRequest();
+        this.cancelActiveEditorLoading();
 
         // 检查是否有有效的选择
         const editor = vscode.window.activeTextEditor;
@@ -1589,13 +1936,15 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
             if (contentInfo.jmpUri) {
                 this.currentUri = this.parseExternalUri(contentInfo.jmpUri);
                 this.currentLine = contentInfo.range.start.line;
+                this.currentColumn = contentInfo.range.start.character;
             }
             
             if (this._updateMode === UpdateMode.Live || contentInfo.jmpUri) {
                 this._currentCacheKey = newCacheKey;
                 
                 this._history = [];
-                this._history.push({ content: contentInfo, navigateLine: this.currentLine });
+                // 这一条没有「点击离开」的历史，落点就用定义名自身的起始位置
+                this._history.push({ content: contentInfo, navigateLine: this.currentLine, navigateColumn: this.currentColumn });
                 this._historyIndex = 0;
 
                 this.updateContent(contentInfo);
@@ -1621,7 +1970,7 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
 
         if (definitions.length > 1) {
             const currentPosition = editor.selection.active;
-            definition = await this.showDefinitionPicker(definitions, editor, currentPosition);
+            definition = await this.showDefinitionPicker(definitions, editor.document.uri, currentPosition);
             if (!definition) {
                 return createEmptyContent();
             }
@@ -1649,14 +1998,15 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
         this._updateMode = config.get<UpdateMode>('contextWindow.updateMode') || UpdateMode.Sticky;
     }
 
-    private async showDefinitionPicker(definitions: any[], editor: vscode.TextEditor, currentPosition?: vscode.Position): Promise<any> {
+    private async showDefinitionPicker(definitions: any[], sourceUri: vscode.Uri, currentPosition?: vscode.Position): Promise<any> {
         // 准备定义列表数据并发送到webview
         try {
             const definitionListData = definitions.map((definition, index) => {
                 try {
                     let def = definition;
-                    let uri = (def instanceof vscode.Location) ? def.uri : def.targetUri;
-                    let range = (def instanceof vscode.Location) ? def.range : (def.targetSelectionRange ?? def.targetRange);
+                    const isLocation = !!(def && def.uri && def.range);
+                    let uri = isLocation ? def.uri : def.targetUri;
+                    let range = isLocation ? def.range : (def.targetSelectionRange ?? def.targetRange);
             
                     // 使用全路径
                     const displayPath = uri.fsPath;
@@ -1682,9 +2032,9 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
             this._pickItems = validDefinitions;
             
             // 只有在多个定义时才发送定义列表数据到webview
-            if (this._view && validDefinitions.length > 1) {
+            if ((this._view || this._currentPanel) && validDefinitions.length > 1) {
                 // 尝试找到与当前位置最匹配的定义作为默认选择
-                const currentFileUri = editor.document.uri.toString();
+                const currentFileUri = sourceUri.toString();
                 let defaultIndex = 0;
                 let bestMatch = -1;
                 let minDistance = Number.MAX_SAFE_INTEGER;
@@ -1696,7 +2046,7 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
                         if (def && def.uri === currentFileUri) {
                             // 计算位置距离（行数差 * 1000 + 列数差）
                             const lineDiff = Math.abs(def.lineNumber - currentPosition.line);
-                            const charDiff = Math.abs(def.columnNumber - currentPosition.character);
+                            const charDiff = Math.abs((def.columnNumber - 1) - currentPosition.character);
                             const distance = lineDiff * 1000 + charDiff;
                             
                             if (distance < minDistance) {

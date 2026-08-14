@@ -4,6 +4,26 @@ All notable changes to the "context-window" extension will be documented in this
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [1.0.6] 2026.08.01
+
+#### Changed
+
+- Restore the original VS Code token after navigating to a definition in Context Window.
+- Align Sticky Scroll with VS Code, including selection and copy support with either mouse button.
+- Improve TypeScript and JavaScript Sticky Scroll for brace-based blocks and constructors.
+- Avoid repeated definition-provider calls and prevent semantic highlighting from blocking resolved definitions.
+
+## [1.0.5] 2026.07.31
+
+#### Changed
+
+- Use VS Code TextMate and semantic token parsing by default.
+- Keep bracket-pair colorization and minimap colors synchronized with the active VS Code theme.
+- Add Sticky Scroll hover, modifier-link styling, and Ctrl/Cmd-click definition navigation.
+- Invalidate stale context cache entries after internal navigation and definition selection.
+- Allow token style editing to explicitly clear inherited bold and italic styles.
+- Preserve robust UNC/encoded URI navigation, definition request cancellation, floating definition lists, and long-path display enhancements.
+
 ## [1.0.3] 2026.07.09
 
 #### Changed

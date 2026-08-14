@@ -2,6 +2,7 @@
 
 // 导入语言配置与各功能模块
 import { createDocumentSymbolProvider } from './documentSymbolProvider.js';
+import { createBraceFoldingRangeProvider } from './braceFoldingProvider.js';
 import { resetPickColorPosition } from './tokenPicker.js';
 import { applyMonacoTheme, isLightTheme, installSemanticRenderMatch } from './editorTheme.js';
 import { injectEditorStyles } from './editorStyles.js';
@@ -202,6 +203,7 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                             smoothScrolling,
                             tokenColorCustomizations,
                             detectIndentation,
+                            bracketPairColorization,
                             ...otherOptions
                         } = vsCodeConfig;
 
@@ -234,6 +236,10 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                             tokenColorCustomizations,
                             // 其他有效选项
                             ...otherOptions,
+                            bracketPairColorization: {
+                                ...(bracketPairColorization || {}),
+                                enabled: contextEditorCfg.bracketPairColorization !== false
+                            },
                             // 自定义 Hover Provider 走扩展端 LSP（vscode.executeHoverProvider），
                             // 不依赖 Monaco 内置 Worker，规避了「webview 中 Worker 长期 pending → 浮窗一直 loading」。
                             // 见 hoverProvider.js / contextView.ts 的 requestHover 处理。
@@ -261,6 +267,14 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                             //跟随 VS Code 明确配置
                             model.updateOptions({ insertSpaces: defaultInsertSpaces, tabSize: defaultTabSize });
                         }
+
+                        const cfg = window.vsCodeEditorConfiguration?.contextEditorCfg || {};
+                        model.updateOptions({
+                            bracketColorizationOptions: {
+                                enabled: cfg.bracketPairColorization !== false,
+                                independentColorPoolPerBracketType: false
+                            }
+                        });
                     }
 
                     // 创建编辑器实例
@@ -272,7 +286,8 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                     const currentStickyScroll = editor.getOption(monaco.editor.EditorOption.stickyScroll);
                     window.stickyScroll = currentStickyScroll?.enabled;
                     // sticky scroll 的 defaultModel 由 editorContent.js 的 refreshStickyScroll 按当前文件语言动态切换：
-                    // TS/JS 用 indentationModel（其 outline 在 webview 中不可用），其它语言用 outlineModel（显示函数名）。
+                    // TS/JS 用 foldingProviderModel（其 outline 在 webview 中不可用，缩进模型又处理不了「{ 独占一行」），
+                    // 其它语言用 outlineModel（显示函数名）。
 
                     // 让语义着色渲染按 VSCode 选择器匹配「类型+修饰符」组合规则（如 class.constructorOrDestructor），
                     // 而非 Monaco 默认的 TextMate 前缀匹配。须在语义 token 到达前安装。
@@ -515,12 +530,15 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
 
                     // 为 C++, C, C# 注册 Document Symbol Provider（从 documentSymbolProvider.js 导入）
                     // 这些语言走 sticky scroll 的 outlineModel，依赖此同步 symbol provider 显示函数/类名。
-                    // （TS/JS 走 indentationModel，不需要 symbol provider，故不注册。）
                     if (contextEditorCfg.fixStickyScroll) {
                         monaco.languages.registerDocumentSymbolProvider('cpp', createDocumentSymbolProvider(monaco));
                         monaco.languages.registerDocumentSymbolProvider('c', createDocumentSymbolProvider(monaco));
                         monaco.languages.registerDocumentSymbolProvider('csharp', createDocumentSymbolProvider(monaco));
                     }
+
+                    // TS/JS 的 sticky scroll 使用花括号折叠 provider，支持独占一行的左花括号。
+                    monaco.languages.registerFoldingRangeProvider('typescript', createBraceFoldingRangeProvider(monaco));
+                    monaco.languages.registerFoldingRangeProvider('javascript', createBraceFoldingRangeProvider(monaco));
 
                     //editor.onDidScrollChange(forcePointerCursor);
                     //editor.onDidChangeConfiguration(forcePointerCursor);
@@ -852,6 +870,7 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                                                     fontFamily: message.contextEditorCfg.fontFamily
                                                 }
                                             );
+                                            applyIndentationForModel(editor.getModel());
                                             // 必须用 setTheme 显式重应用：主题名仍是 'custom-vs'，updateOptions({theme})
                                             // 会因字符串未变而短路、不重渲染；setTheme 能识别 defineTheme 生成的新主题对象并
                                             // 触发 onDidColorThemeChange 重新着色，使右键取色的改动即时生效（修复"取到的对、渲染没刷新"）。

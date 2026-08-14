@@ -31,6 +31,24 @@ body {
 .cw-cursor-pointer, .cw-cursor-pointer * { cursor: pointer !important; }
 .cw-cursor-default, .cw-cursor-default * { cursor: default !important; }
 
+.monaco-editor .sticky-widget .sticky-line-content:hover,
+.monaco-editor .sticky-widget .sticky-line-content:hover * {
+    cursor: pointer !important;
+}
+
+.monaco-editor .sticky-widget .cw-sticky-link {
+    text-decoration: underline !important;
+    text-underline-offset: 2px;
+}
+
+/* Sticky Scroll selection is rendered separately because sticky lines do not
+   participate in Monaco's normal selection layer. */
+.monaco-editor .sticky-widget .cw-sticky-selection {
+    position: absolute;
+    pointer-events: none;
+    background-color: var(--cw-sticky-selection-bg, var(--vscode-editor-selectionBackground));
+}
+
 
 /* 专门针对 Monaco Editor 的滚动条样式 */
 .monaco-editor .monaco-scrollable-element .slider.horizontal {
