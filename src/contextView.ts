@@ -49,8 +49,8 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
 
     private _view?: vscode.WebviewView;
     private _currentCacheKey: CacheKey = cacheKeyNone;
-    private _loading?: { cts: vscode.CancellationTokenSource }
-    private _definitionRequest?: { cts: vscode.CancellationTokenSource }
+    private _loading?: { cts: vscode.CancellationTokenSource };
+    private _definitionRequest?: { cts: vscode.CancellationTokenSource };
 
     private _updateMode = UpdateMode.Sticky;
     private _pinned = false;
@@ -556,7 +556,7 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
     }
 
     private navigate(direction: 'back' | 'forward') {
-        let lastIdx = this._historyIndex;
+        const lastIdx = this._historyIndex;
         // 实现导航逻辑
         if (direction === 'back' && this._historyIndex > 0) {
             this._historyIndex--;
@@ -1572,7 +1572,7 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
 
     private async createFloatingWebview() {
         let title = "Context Window";
-        let curContext = this.getCurrentContent();
+        const curContext = this.getCurrentContent();
         if (curContext?.content && curContext.content.jmpUri) {
             let filePath;
             try {
@@ -1580,7 +1580,7 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
             } catch (e) {
                 filePath = curContext.content.jmpUri;
             }
-            let filename = filePath.split('/').pop()?.split('\\').pop();
+            const filename = filePath.split('/').pop()?.split('\\').pop();
             title = filename ?? "Context Window";
         }
 
@@ -2003,10 +2003,10 @@ export class ContextWindowProvider implements vscode.WebviewViewProvider, vscode
         try {
             const definitionListData = definitions.map((definition, index) => {
                 try {
-                    let def = definition;
+                    const def = definition;
                     const isLocation = !!(def && def.uri && def.range);
-                    let uri = isLocation ? def.uri : def.targetUri;
-                    let range = isLocation ? def.range : (def.targetSelectionRange ?? def.targetRange);
+                    const uri = isLocation ? def.uri : def.targetUri;
+                    const range = isLocation ? def.range : (def.targetSelectionRange ?? def.targetRange);
             
                     // 使用全路径
                     const displayPath = uri.fsPath;

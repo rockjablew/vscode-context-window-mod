@@ -12,7 +12,8 @@ module.exports = {
 	],
 	overrides: [
 		{
-			"excludedFiles": "*.js"
+			files: ["**/*.js"],
+			rules: {}
 		}
 	],
 	rules: {
