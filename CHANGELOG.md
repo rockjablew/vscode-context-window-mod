@@ -4,25 +4,188 @@ All notable changes to the "context-window" extension will be documented in this
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [1.1.5] 2026.10.11
+
+#### Added
+
+- Relation’s node menu adds **Center in View** (scrolls that node to the middle), **Copy Name**, and an implementation list on the center and on outgoing nodes. Picking one recenters the graph when the node is the center; on an outgoing node it replaces that node and leaves it collapsed. The list fills in as overrides arrive, and says when the search times out.
+- Context Window’s right-click menu lists **Implementations** for the function under the cursor, including a library function, and opens the one you pick.
+
+#### Changed
+
+- When the center is a subclass, a `this.x()` inside a parent method connects to the most specific override on the center type’s chain.
+
+#### Fixed
+
+- Show Relation on a library call such as `add_Completed` still looks up the enclosing caller, but the canvas stays on the opened symbol until that lookup finishes. The line back to the caller stays clickable.
+- Line blame on a line that is not committed yet uses the avatar for your git email, the same picture as lines you have committed.
+- The Open Changes icon in the line-blame hover lines up with the commit id.
+- Choosing an implementation clears the definition list on the left.
+- A jump that lands on the definition already shown does not add another history entry.
+
+## [1.1.4] 2026.09.25
+
+#### Changed
+
+- Relation remembers each center’s pan, zoom, and node layout. Switching back opens that last view; leaving again stores the latest one.
+- Context Window jump trail and Relation center trail: the current hop uses the hover text color, with a slightly stronger background.
+- Relation call-site preview keeps the callee name and the next character fully visible. A line that does not fit is ellipsized on the left.
+- A node at the hop limit shows a red × instead of + / −. Its tip says to double-click to recenter and keep walking.
+- Neighbor peek stays one-sided (left incoming, right outgoing) and uses the same `prepareCallHierarchy` pick as double-click recenter.
+- Find Relation follows the same incoming rules as Relation. The word under the cursor is shared by Context Window and Relation through one cache key.
+- Relation keeps an index cache of lookup results (callers, reachability, partial scans), shared by the panel, Find Relation, and MCP. A file edit drops entries that depend on it. Memory cap is `contextView.callRelation.indexMemoryMB` (default 100MB).
+- TypeScript and JavaScript skip Type Hierarchy. That language server has none, so those calls were empty round-trips.
+
+#### Fixed
+
+- Semantic token colors recover when the language server’s legend was still empty the first time Monaco asked for it.
+- Relation reads files over Remote SSH (`vscode-remote`), not only local disk (#12).
+
+## [1.1.3] 2026.09.19
+
+#### Added
+
+- Context Window **line-blame hover**: `http://` / `https://` URLs and `<a href>` in the commit message are clickable and open in the system browser (the webview cannot navigate itself).
+- Relation paints the **center node immediately** from the identifier under the cursor (or the enclosing callable), then fills callers / callees when Call Hierarchy or Find References returns.
+- Relation cost logs (`RELATION_COST` in `callRelation.ts`) cover neighbor prefetch: each incoming/outgoing job, batch totals, and the slow steps inside a fetch (resolve, LSP, sites, override-incoming merge with `files` / `lineHits`).
+
+#### Changed
+
+- Context Window caches a disk **mtime + size** stamp with each file. After `git checkout` or other on-disk edits that do not bump `documentVersion`, stale frontend and backend caches are dropped and the file is read from disk. Unsaved editor buffers still win over disk. Reusing the on-screen body for a range-only jump requires that document to still be open; a closed tab reloads.
+- Relation neighbor prefetch runs **after the first paint** and does not block it. + / − appear only after a peek confirms callers or callees. While a side is loading, a focus-blue arc travels around the whole node (not the +). Expand All adds at most 40 nodes per run (run again to continue) and skips library paths; it does not pan to keep new nodes in view.
+- Relation (References): double-clicking a **non-root function** recenters in **Call** mode on that function. Double-clicking the References center does nothing.
+- Relation override-incoming: classify and incoming call-site filtering read each file’s line text from disk (or an already-open editor) without `openTextDocument`. `static` methods skip the ancestor-slot merge (declaration line or the line above, then a semantic-token `static` modifier on the name). Per-type heritage walks are reused until any file changes. Prefetch runs at most two incoming peeks at a time and at most one outgoing peek per file per wave. Keep/drop rules for instance overrides are unchanged.
+
+#### Fixed
+
+- Dragging from the start of a line to its end no longer flashes and then drops the selection: an in-text drag that grows through partial ranges is not treated as a line-number click, and git line-blame does not redraw its trailing annotation during the drag. Double-clicking a line number still selects the enclosing symbol.
+- Relation: Collapse All recenters the canvas on the current symbol. Expanding one hop with + pans just enough to keep that node and its new children in view.
+- Relation: after a double-click that recenters on a node, that node’s tip stays attached to it. A hover timer from the previous graph no longer places the tip at the top-left of the webview.
+- Relation: reopening the same symbol no longer short-circuits while incoming or outgoing is still uncached. Nodes with no callees are cached empty so prefetch does not spin forever. References-mode enclosing nodes are prepared with the language server before neighbor fetches, so expand is not empty. Twin-path tips mention Hold Alt to highlight the other copies.
+
+## [1.1.2] 2026.09.13
+
+#### Added
+
+- **Find Relation**: reuses Show Relation's incoming walk — callers of a function, or reference sites of a variable / field / type — and lists every site in the sidebar REFERENCES view (same panel as Find All References). Click a result to open that location in the editor. Editor and Context Window right-click menus, plus the command palette. The walk loads only first-level incoming (no outgoing, no neighbor prefetch). Starting a search clears the previous REFERENCES list first and cancels the previous Find.
+- Context Window **Refresh**: footer button left of Jump mode. Reloads the file on screen from the editor, dropping the view’s caches. Works while pinned. No on/off state.
+
+#### Changed
+
+- Double-click bracket/quote pair selection is one switch again (`contextView.contextWindow.doubleClickSelectsBracketPair`). It covers the main editor and the Context Window; the footer `{si}` indicator, the editor right-click menu, and the keyboard shortcut all toggle that same setting. The separate `contextDoubleClickSelectsBracketPair` key is removed.
+- Footer Sticky Scroll icon: the three stacked bars are thinner, and the pin is smaller, so they match the stroke weight of the other view toggles.
+- Footer Jump Trail icon: Lucide `route` (start and end nodes on a path), not a middle dot or name stubs.
+- Switching Jump mode (Definition / Type Definition / Implementation / References) no longer rebuilds the Monaco theme, so the editor colors do not flash before the new lookup lands.
+- Relation toolbar: Pin is a thin round-head thumbtack (outline sideways with the needle left when free, outline upright when stuck), not the window `$(pin)` / `$(pinned)`. No blue highlight. Live / Sticky also drop the blue fill and keep the eye plus label. Buttons are tighter so the remaining on-state blue is not a thick chip, with 3px of vertical padding so Slim’s fill is not clipped. A Jump Trail icon after Slim shows or hides the center path at the top. Pin sits before Slim. Slim is a funnel plus a kinds caret, not the word Slim; only the funnel goes blue when the filter is on.
+
+#### Fixed
+
+- Relation incoming: `super` / `base` / `::` parent calls and the method declaration line are not treated as callers of a child override. TypeScript’s call hierarchy often reports those sites on the override; they are dropped per site, so a method that also has a real `this.xxx()` / `obj.xxx()` call is kept. Incoming / outgoing results are not written to the cache if the graph was reset (close the window, or start another load) while the language server was still answering.
+- Semantic tokens such as `console` (`variable.defaultLibrary`) take their color from the current language’s TextMate probe (`support.variable.ts` in TypeScript), including the user’s `tokenColorCustomizations`, instead of a generic `variable` / `support.variable` fallback.
+- Template interpolations such as `${lod}` keep the TextMate `${` / `}` tokens and their colors. The view uses the language’s VS Code configuration (`${` paired with `}`, not in colorized brackets) so bracket pair colorization does not split `${` or recolor `}`.
+- Bracket pair colors overlay TextMate token colors, as in VS Code. A method `{` (`punctuation.definition.block`) keeps highlight 2 instead of the user’s `punctuation` purple. `()` `[]` `<>` use VS Code’s per-type color pool, so they do not share a level with `{}`. Encoded TextMate tokens now carry Monaco’s language id, so a class `{` and a nested method `{` get highlight 1 and 2 instead of both staying on the punctuation color.
+- `=>` `>=` and comment/`string` `<` `>` are not treated as `<>`. TextMate `unbalancedBracketScopes` (and comment/string token types) keep those operators on their token color.
+- Relation: an override lists callers of every same-named class/interface slot on its ancestor chain. A call site is classified by its enclosing type (on this chain / sibling heritage / external), not by a `this.` token, so `self.` and implicit members follow the same rule. On-chain calls keep only the nearest (for example `MoveableActionBase.Prepare` for `OnPrepare`). Sibling-hierarchy calls are not added. External receivers such as `action.InterruptByController()` are kept. A `this.xxx()` outgoing call whose name has `override` on that chain shows the implementation closest to the current class (the current class if it implements it), not the original base declaration. `super` / `base` / `::` still go to the parent implementation. Incoming callers that are arrows / `<function>` / callbacks are shown as the enclosing named method (for example `CreateTimelineTask` instead of the arrow that calls `this.GetTimelineAsset()`), using a real Call Hierarchy item so that method’s own callers can still expand. A purple ↻ that also sits on other call paths still jumps to the next copy; the badge stays ↻.
+
+## [1.1.1] 2026.09.05
+
+#### Changed
+
+- Token Style picker: keeps the new preview (word + scope) alongside the original color / Bold / Italic row.
+- Footer: Sticky is now a closed eye, and Jump Trail, Sticky Scroll, and Git Line Blame are icon toggles. Sticky Scroll starts from the resolved setting. The footer keeps its width when Sticky toggles, and the filename strip fills the gap left of the controls.
+
+#### Added
+
+- Git line blame in the **main editor** (`contextView.editor.lineBlame`, on by default). 
+- MCP: the extension serves its code intelligence to AI assistants (`contextView.mcp.enabled`, on by default) with two tools — `code_relations` (callers and callees as a tree with the exact call sites, or every reference to a variable or type grouped by its function) and `enclosing_symbol` (the smallest function, method, class, or namespace containing a line, with its range and source). It runs inside the extension, on loopback, with a bearer token regenerated on every start. VS Code 1.101 and later find it with no configuration; every other client is set up by **Configure MCP Server Entry**, which edits that client's file in place to run a bridge script that looks the changing address up at launch.
+- Relation: **Search and Open Relation** (`contextView.callRelation.quickOpen`) searches the workspace from a Quick Pick, groups hits by file, and opens Relation on the chosen line; **... More** appends more results. It does not jump to the Search view.
+- Relation: export the graph from the canvas right-click menu — **Export as SVG / PNG** to a save dialog (snapshots of the current view), or **Copy as Mermaid / DOT** straight to the clipboard (structure only, laid out by the target renderer).
+- Relation (Call): the mouse back / forward buttons walk the center trail.
+- Line-blame hover: an author's Gravatar is downloaded once per session, so later hovers paint it from memory instead of going back to the network.
+
+#### Fixed
+
+- Context / Relation open straight into an independent window, without flashing a tab in the main group or leaving an empty window behind. Focus is observed rather than forced, so locking the editor group and Always on Top land on the right window; hosts that cannot open an empty window still fall back to detaching the tab.
+- Reload keeps the floating Context Window with its jump trail, and the Relation panel. Missing files are dropped from the trail; the Relation trail of previous hops is not restored.
+- Relation (References): left-side nodes group under the real enclosing function instead of TypeScript's broken arrow names, and after a class is shown as References, opening `constructor` reloads the call graph.
+- **Double Click Selects Symbol** no longer disturbs line-number selection: dragging from a line number keeps the start line, and press-and-drag is no longer mistaken for a double click.
+- Toggling `{ }` no longer rebuilds the Monaco theme; only the behavior flag is written, and the control stays visible when off.
+
+## [1.1.0] 2026.08.31
+
+#### Changed
+
+- Call Relation toolbar: click Name / Order. Order sorts callees by first call, callers by file name then call line.
+- Line-blame hover grows to the free space above or below the line, and scrolls only when the commit message still does not fit.
+- Extension display name is **Context View**. The bottom panel is still **Context Window**.
+- Relation window (command **Show Relation**): call hierarchy for functions (`super` / `base` calls resolve to the base method, not the override), and Find All References for variables/fields/types (interface, class, enum, …) grouped by enclosing function (right side empty, like Source Insight). The title shows **Relation (Call)** or **Relation (References)**. Event / callable-type defs that land on a `()` call signature keep the identifier under the cursor (e.g. onDidChangeTextEditorSelection) as the References center. A use is not grouped under an anonymous `name() callback` of the same name; the next outer function is used instead. Getters/setters (document-symbol Property) count as enclosing functions; the node label is the accessor name without a `(get)` / `(set)` prefix, and a click highlights that name. In References mode double-click / trail hops do not change the center (those nodes are not Call Hierarchy items); a click selects the node and, for names like setTimeout() callback, highlights the callee ident. Graph with expand/collapse, Elbow / Direct / Arc connectors (default Arc, chosen from a dropdown), zoom, pan (empty canvas or on a node), and Pin. Also: custom dwell tips (toolbar toggle; Alt when off), find, keyboard navigation, Slim (drop noisy LSP kinds), Alt+click path pin, ×N / ↻ for the same symbol on other paths (hold Alt to highlight all copies), library groups, and Expand All that skips library groups and adds at most 120 nodes per run. Re-run Expand All to continue. Opening a node is immediate; hover includes the arrowhead. If Call Hierarchy is empty at a call site (including when prepare returns nothing), the enclosing caller is loaded as center, the opened symbol is found among its callees, and the center switches to that child; if the callee is not among those children, the caller graph stays and a notice explains that the language server has no hierarchy for the opened symbol. Closing the window clears the graph; Sticky only keeps the last result while the window stays open.
+
+## [1.0.9] 2026.08.30
+
+#### Added
+
+- Jump trail at the top of the Context Window: shows the definition hop chain, with a configurable item limit and a right-click **Copy Call Chain** command.
+- Git line blame: after clicking a line number or the empty end of a line, show a trailing git summary; hold Alt to open a hover card (author, time, message, and changes). Can be toggled from the right-click menu. Hover card layout and dark-theme contrast were refined.
+- Jump mode pull-up in the Context footer: **Definition** (default), **Type Definition**, **Implementation**, and **References**. References open in the Context panel instead of the main editor.
+- Call Relation window: call hierarchy graph with expand/collapse, Elbow / Direct / Arc connectors (default Arc, chosen from a dropdown), zoom, pan (empty canvas or on a node), and Pin. Also: custom dwell tips (toolbar toggle; Alt when off), find, keyboard navigation, Slim (drop noisy LSP kinds), Alt+click path pin, ×N / ↻ for the same symbol on other paths (hold Alt to highlight all copies), library groups, and Expand All that skips library groups and adds at most 120 nodes per run. Re-run Expand All to continue. Opening a node is immediate; hover includes the arrowhead. If Call Hierarchy is empty at a call site (including when prepare returns nothing), the enclosing caller is loaded as center, the opened symbol is found among its callees, and the center switches to that child; if the callee is not among those children, the caller graph stays and a notice explains that the language server has no hierarchy for the opened symbol. Closing the window clears the graph; Sticky only keeps the last result while the window stays open.
+- Open Context and Call Relation in an independent floating window, with Always on Top. Opening again focuses the existing window instead of detaching the current editor.
+
+## [1.0.8] 2026.08.13
+
+#### Added
+
+- Recognize JavaScript definitions.
+
+#### Changed
+
+- Upgrade Monaco Editor to 0.56.0.
+- Disable `doubleClickSelectsBlock` so double-click selection stays consistent with previous versions.
+- Remove the document symbol provider from sticky scroll.
+- In light theme, use a brighter border for the custom highlight on the token you jumped back to (background color unchanged).
+
+#### Fixed
+
+- A definition placed too far to the right could be clipped; prefer aligning the definition to the left so it stays visible.
+
+## [1.0.7] 2026.08.08
+
+#### Added
+
+- Added a `stickyScroll` configuration option to control the sticky scroll behavior of the Context window.
+- Apply custom highlight to the token after jumping back from a definition.
+
+#### Changed
+
+- Switched semantic token parsing to asynchronous mode for better responsiveness.
+- Optimized cursor display: show the cursor on keyboard input and hide it otherwise, with more accurate cursor and line positioning.
+- Improved performance and stability of definition navigation and document parsing.
+
+#### Fixed
+
+- Immediately reveal the target line in the center after navigation (#11).
+- Fixed focus not being set correctly on right-click.
+- Fixed whole-word matching in find.
+- Fixed occurrence highlighting inside comments.
+
 ## [1.0.6] 2026.08.01
 
 #### Changed
 
-- Restore the original VS Code token after navigating to a definition in Context Window.
-- Align Sticky Scroll with VS Code, including selection and copy support with either mouse button.
-- Improve TypeScript and JavaScript Sticky Scroll for brace-based blocks and constructors.
-- Avoid repeated definition-provider calls and prevent semantic highlighting from blocking resolved definitions.
+- After jumping to a definition in Context window, clicking the original token in VSCode should be able to restore back to the definition.
+- Make sticky scroll consistent with VS Code, and enable selection via left and right mouse buttons.
 
-## [1.0.5] 2026.07.31
+## [1.0.5] 2026.07.29
 
 #### Changed
 
-- Use VS Code TextMate and semantic token parsing by default.
-- Keep bracket-pair colorization and minimap colors synchronized with the active VS Code theme.
-- Add Sticky Scroll hover, modifier-link styling, and Ctrl/Cmd-click definition navigation.
-- Invalidate stale context cache entries after internal navigation and definition selection.
-- Allow token style editing to explicitly clear inherited bold and italic styles.
-- Preserve robust UNC/encoded URI navigation, definition request cancellation, floating definition lists, and long-path display enhancements.
+- Some bug fixes.
+- Uses VS Code's TextMate and semantic parser by default.
+
+## [1.0.4] 2026.07.28
+
+#### Changed
+
+- Fixed pick token style.
 
 ## [1.0.3] 2026.07.09
 
@@ -32,8 +195,6 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 - Fixed incorrect hover tips.
 - Added an extended double-click selection mode, similar to Source Insight: double-clicking to the left of a bracket selects the bracket pair together with its contents.
 - Fixed incorrect keyword style settings.
-- Improved external navigation for UNC shares, encoded paths, and alternate file URI forms.
-- Restored full filename/path tooltips and horizontal scrolling for long paths in the bottom bar.
 
 ## [1.0.2] 2026.06.30
 

@@ -1,17 +1,18 @@
 {
   "name": "context-window",
-  "displayName": "Context Window",
-  "description": "Display full code context in the panel, similar to the context window in Source Insight.",
-  "version": "1.0.8",
+  "displayName": "Context View",
+  "description": "Source Insight–style Context Window and Relation (calls/callers) in VS Code.",
+  "version": "1.1.5",
   "publisher": "zhiminxiong",
   "keywords": [
-    "context",
-    "definition",
     "source insight",
-    "docs",
-    "hover",
-    "sidebar",
-    "panel"
+    "call hierarchy",
+    "call graph",
+    "references",
+    "go to definition",
+    "git blame",
+    "navigation",
+    "context window"
   ],
   "galleryBanner": {
     "color": "4C4C4C",
@@ -22,8 +23,8 @@
     "vscode": "^1.50.0"
   },
   "categories": [
-    "Other",
-    "Programming Languages"
+    "Visualization",
+    "Other"
   ],
   "activationEvents": [
     "onView:contextView.context",
@@ -42,6 +43,24 @@
     "workspace"
   ],
   "contributes": {
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "contextViewMcpProvider",
+        "label": "Context View"
+      }
+    ],
+    "colors": [
+      {
+        "id": "contextView.lineBlameForeground",
+        "description": "Foreground of the git blame annotation at the end of the cursor's line. Defaults to the same translucent gray GitLens uses for its trailing annotation, so it stays behind the code rather than competing with it.",
+        "defaults": {
+          "dark": "#99999959",
+          "light": "#99999959",
+          "highContrast": "#999999a0",
+          "highContrastLight": "#999999a0"
+        }
+      }
+    ],
     "viewsContainers": {
       "panel": [
         {
@@ -63,15 +82,20 @@
     },
     "commands": [
       {
+        "command": "contextView.toggleLogging",
+        "title": "Toggle Debug Log",
+        "category": "Context View"
+      },
+      {
         "command": "contextView.contextWindow.pin",
         "title": "Pin Current Context",
-        "icon": "$(pin)",
+        "icon": "media/pin.svg",
         "category": "Context View"
       },
       {
         "command": "contextView.contextWindow.unpin",
         "title": "Unpin Current Context",
-        "icon": "$(pinned)",
+        "icon": "media/pinned.svg",
         "category": "Context View"
       },
       {
@@ -83,6 +107,10 @@
         "title": "Display the floating Context Window"
       },
       {
+        "command": "vscode-context-window.floatIndependent",
+        "title": "Display the floating Context Window (Independent Window)"
+      },
+      {
         "command": "vscode-context-window.navigateUri",
         "title": "Navigate to the uri and line",
         "category": "Context View"
@@ -91,6 +119,71 @@
         "command": "contextView.contextWindow.toggleSelectBracketPair",
         "title": "Toggle: Double-Click Selects Whole Bracket/Quote Pair (incl. delimiters)",
         "category": "Context View"
+      },
+      {
+        "command": "contextView.callRelation.show",
+        "title": "Show Relation",
+        "icon": "$(type-hierarchy)",
+        "category": "Context View"
+      },
+      {
+        "command": "contextView.callRelation.showIndependent",
+        "title": "Show Relation (Independent Window)",
+        "icon": "$(type-hierarchy)",
+        "category": "Context View"
+      },
+      {
+        "command": "contextView.callRelation.findRelation",
+        "title": "Find Relation",
+        "icon": "$(references)",
+        "category": "Context View"
+      },
+      {
+        "command": "contextView.callRelation.findRelationInContext",
+        "title": "Find Relation (in ContextView)",
+        "icon": "$(type-hierarchy)",
+        "category": "Context View"
+      },
+      {
+        "command": "contextView.callRelation.quickOpen",
+        "title": "Search and Open Relation",
+        "icon": "$(search)",
+        "category": "Context View"
+      },
+      {
+        "command": "contextView.callRelation.find",
+        "title": "Find in Relation",
+        "category": "Context View"
+      },
+      {
+        "command": "contextView.callRelation.findNext",
+        "title": "Find Next in Relation",
+        "category": "Context View"
+      },
+      {
+        "command": "contextView.callRelation.findPrevious",
+        "title": "Find Previous in Relation",
+        "category": "Context View"
+      },
+      {
+        "command": "contextView.mcp.showEndpoint",
+        "title": "Show MCP Endpoint",
+        "category": "Context View"
+      },
+      {
+        "command": "contextView.mcp.configureClient",
+        "title": "Configure MCP Server Entry",
+        "category": "Context View"
+      },
+      {
+        "command": "contextView.mcp.previewRelations",
+        "title": "Preview AI Tool Output: Relations at Cursor",
+        "category": "Context View"
+      },
+      {
+        "command": "contextView.mcp.previewEnclosingSymbol",
+        "title": "Preview AI Tool Output: Enclosing Symbol at Cursor",
+        "category": "Context View"
       }
     ],
     "keybindings": [
@@ -98,6 +191,42 @@
         "command": "vscode-context-window.float",
         "key": "ctrl+shift+9",
         "mac": "cmd+shift+9"
+      },
+      {
+        "command": "contextView.callRelation.find",
+        "key": "ctrl+f",
+        "mac": "cmd+f",
+        "when": "contextView.callRelation.active"
+      },
+      {
+        "command": "contextView.callRelation.findNext",
+        "key": "f3",
+        "when": "contextView.callRelation.active"
+      },
+      {
+        "command": "contextView.callRelation.findNext",
+        "key": "enter",
+        "when": "contextView.callRelation.findOpen"
+      },
+      {
+        "command": "contextView.callRelation.findNext",
+        "key": "cmd+g",
+        "when": "contextView.callRelation.active"
+      },
+      {
+        "command": "contextView.callRelation.findPrevious",
+        "key": "shift+f3",
+        "when": "contextView.callRelation.active"
+      },
+      {
+        "command": "contextView.callRelation.findPrevious",
+        "key": "shift+enter",
+        "when": "contextView.callRelation.findOpen"
+      },
+      {
+        "command": "contextView.callRelation.findPrevious",
+        "key": "cmd+shift+g",
+        "when": "contextView.callRelation.active"
       },
       {
         "command": "contextView.contextWindow.toggleSelectBracketPair"
@@ -112,6 +241,18 @@
         {
           "command": "contextView.contextWindow.unpin",
           "when": "contextView.contextWindow.isPinned"
+        },
+        {
+          "command": "contextView.callRelation.find",
+          "when": "false"
+        },
+        {
+          "command": "contextView.callRelation.findNext",
+          "when": "false"
+        },
+        {
+          "command": "contextView.callRelation.findPrevious",
+          "when": "false"
         }
       ],
       "view/title": [
@@ -125,11 +266,67 @@
           "when": "view == contextView.context && contextView.contextWindow.isPinned",
           "group": "navigation"
         }
+      ],
+      "editor/context": [
+        {
+          "command": "contextView.callRelation.show",
+          "group": "navigation@9",
+          "when": "editorTextFocus"
+        },
+        {
+          "command": "contextView.callRelation.showIndependent",
+          "group": "navigation@10",
+          "when": "editorTextFocus"
+        },
+        {
+          "command": "contextView.callRelation.findRelation",
+          "group": "navigation@11",
+          "when": "editorTextFocus"
+        },
+        {
+          "command": "contextView.callRelation.findRelationInContext",
+          "group": "navigation@12",
+          "when": "editorTextFocus"
+        }
       ]
     },
     "configuration": {
       "title": "Context View",
       "properties": {
+        "contextView.logging": {
+          "type": "boolean",
+          "default": false,
+          "description": "Write Context View debug logs (relation timing, webview, MCP) to the Context View output channel. Off by default. Toggle with \"Context View: Toggle Debug Log\"."
+        },
+        "contextView.independentWindowAlwaysOnTop": {
+          "type": "boolean",
+          "default": false,
+          "description": "When opening Context or Call Relation in an independent window, turn on Always on Top. Off by default to match older versions."
+        },
+        "contextView.mcp.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Serve this window's code intelligence to AI assistants over the Model Context Protocol. Offers two tools: relations (callers, callees, and references from the language server) and enclosing symbol. The endpoint listens on loopback only, on a port picked at startup, and requires a bearer token that is regenerated every time the window starts. Run \"Context View: Show MCP Endpoint\" to see the address."
+        },
+        "contextView.mcp.configFiles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Extra MCP config files to offer in \"Context View: Configure MCP Server Entry\", for clients it does not know about. Each entry is a path to a `.json` file: absolute, starting with `~` for your home directory, or relative to the workspace. The surrounding key is taken from the file itself, defaulting to `mcpServers`."
+        },
+        "contextView.callRelation.indexMemoryMB": {
+          "type": "number",
+          "default": 100,
+          "minimum": 1,
+          "description": "Memory cap, in megabytes, for the relation index. Callers, callees, reference groups, type chains, and receiver checks that have already been resolved are kept so the next lookup can skip the language server. When the index grows past this size, the least recently used entries are dropped. Closing the relation panel does not clear the index."
+        },
+        "contextView.editor.lineBlame": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show a gray git summary (author, time, commit subject) at the end of the cursor's line in the main editor, and a hover with the full message and an Open Changes link. Meant to replace the same annotation from GitLens — if `gitlens.currentLine.enabled` is also on you will see both, so turn one of them off. While a line has unsaved edits it reads \"Uncommitted changes\" instead: `git blame` numbers lines by the file on disk, so its answer no longer lines up with what is on screen."
+        },
         "contextView.contextWindow.updateMode": {
           "type": "string",
           "description": "Controls how the context view is updated when the cursor moves.",
@@ -181,7 +378,7 @@
         "contextView.contextWindow.useDefaultTokenizer": {
           "type": "boolean",
           "default": false,
-          "description": "Using the default tokenizer of Monaco Editor.\nTake effect when VSCode starts."
+          "description": "Deprecated. Off by default.\nContext Window now uses the same TextMate and semantic tokenization as VS Code. Enabling this falls back to Monaco Editor's default tokenizer.\nTakes effect when VS Code starts."
         },
         "contextView.contextWindow.fixToken": {
           "type": "boolean",
@@ -220,13 +417,187 @@
         },
         "contextView.contextWindow.doubleClickSelectsBracketPair": {
           "type": "boolean",
+          "default": true,
+          "description": "Double-clicking next to a bracket ( [ { < or a quote \" ' ` selects the whole matching pair INCLUDING the delimiters. Applies to the main editor (left double-click) and the Context Window (right-button double-click). Complements VS Code’s built-in editor.doubleClickSelectsBlock, which selects only the content inside. On by default. Toggle from the footer {si} indicator, the editor right-click menu, or the keyboard shortcut. In the main editor, VS Code never exposes double-click events to extensions, so the double-click is inferred from the shape of the selection (word selection always yields one complete run of same-class characters, a drag does not); a drag that happens to stop exactly on a run boundary still looks like a double-click (the } of a `});` line is the classic example), in which case just keep dragging and normal drag selection resumes."
+        },
+        "contextView.contextWindow.doubleClickSelectsBracketPairDragGuard": {
+          "type": "number",
+          "default": 60,
+          "minimum": 0,
+          "maximum": 400,
+          "description": "Extra drag guard, in milliseconds, for doubleClickSelectsBracketPair. Rejects a selection that arrives sooner than this after the mouse went down, i.e. the first frame of a press-and-drag. The primary check is not time based: VSCode always runs word selection before a double-click can widen anything, so the extension replays that word-selection algorithm and only acts when the incoming selection matches it exactly. Set to 0 to disable this extra guard."
+        },
+        "contextView.contextWindow.doubleClickSelectsBracketPairConfirmDelay": {
+          "type": "number",
+          "default": 90,
+          "minimum": 0,
+          "maximum": 500,
+          "description": "Confirmation window, in milliseconds, for doubleClickSelectsBracketPair. The pair selection is held back this long and dropped if the mouse keeps moving, so nothing touches the selection until a double-click is certain. Note that no purely time based guard can stop a slow drag, since crossing one character may take hundreds of milliseconds; that is what the word-selection check is for, and a drag that still slips through is undone as soon as you keep dragging. Lower it for a snappier response, raise it if a slow drag still triggers the pair selection."
+        },
+        "contextView.contextWindow.doubleClickSelectsSymbol": {
+          "type": "boolean",
           "default": false,
-          "description": "Double-clicking right next to a bracket ( [ { < or a quote \" ' ` selects the whole matching pair INCLUDING the brackets/quotes themselves. Complements VSCode's built-in editor.doubleClickSelectsBlock, which selects only the content inside. Toggle it from the status bar ({si}), the editor right-click menu, or the keyboard shortcut."
+          "description": "In the main editor, double-clicking a line number selects the smallest enclosing function, method, class, or namespace. Off by default."
+        },
+        "contextView.contextWindow.contextDoubleClickSelectsSymbol": {
+          "type": "boolean",
+          "default": true,
+          "description": "In the Context Window, double-clicking a line number selects the smallest enclosing function, method, class, or namespace. On by default. Replaces jumping to the same location in the main editor."
         },
         "contextView.contextWindow.enableHover": {
           "type": "boolean",
           "default": false,
           "description": "Show hover tooltips (parameter signatures, JSDoc, etc.) in the Context Window. Hover requests are forwarded to the active language servers of the main editor."
+        },
+        "contextView.contextWindow.occurrencesHighlight": {
+          "type": "boolean",
+          "default": false,
+          "description": "Highlight every occurrence of the word under the cursor, like editor.occurrencesHighlight in the main editor. Off by default: the cursor in the Context Window is placed programmatically when jumping or navigating back, so this highlight easily lands on a neighbouring identifier instead of the token you clicked. The token you jumped out from is always highlighted on its own, regardless of this setting."
+        },
+        "contextView.contextWindow.lineBlame": {
+          "type": "boolean",
+          "default": true,
+          "description": "After clicking a line in the Context Window, show a gray git summary (author, time, commit subject) at the end of that line. Jumping does not show it. Can be toggled from the right-click menu."
+        },
+        "contextView.contextWindow.lineBlameHover": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically show the git line-blame hover when the pointer is over the annotation. Off (default): hold Alt over the annotation to open it. Releasing Alt does not close it. Has no effect unless Git Line Blame is on and an annotation is visible."
+        },
+        "contextView.contextWindow.jumpTrail": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the jump trail (definition hop breadcrumbs) at the top of the Context Window. On by default. Can be toggled from the right-click menu."
+        },
+        "contextView.contextWindow.jumpTrailMaxItems": {
+          "type": "number",
+          "default": 8,
+          "minimum": 2,
+          "description": "Maximum number of named items shown on the jump trail. Extra hops collapse into the … dropdown. The first and current items are always kept. Minimum 2."
+        },
+        "contextView.contextWindow.stickyScroll": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null,
+          "description": "Show sticky scroll (pinned function/class headers) in the Context Window. When null (default), it follows the main editor's editor.stickyScroll.enabled setting. Toggling it from the right-click menu writes this setting explicitly, which then takes precedence over the main editor's value."
+        },
+        "contextView.contextWindow.jumpMode": {
+          "type": "string",
+          "default": "definition",
+          "enum": [
+            "definition",
+            "typeDefinition",
+            "implementation",
+            "references",
+            "relation"
+          ],
+          "enumDescriptions": [
+            "Go to Definition (default). Same as the current click behavior.",
+            "Go to Type Definition. Click a variable to see its type, not where it is declared.",
+            "Go to Implementation. Jump to implementations of an interface or virtual function.",
+            "Find References. Click a symbol to list references in Context, then click one to open that location in the panel (not the main editor).",
+            "Find Relation. Same as Show Relation's incoming side: callers of a function, or references of a variable / field / type. Click one to open that location in the panel (not the main editor)."
+          ],
+          "description": "What a click in the Context Window jumps to. Change it from the pull-up at the right of the Context footer."
+        },
+        "contextView.callRelation.childSort": {
+          "type": "string",
+          "default": "name",
+          "enum": [
+            "name",
+            "order"
+          ],
+          "enumDescriptions": [
+            "A–Z by symbol name (last identifier).",
+            "Callees: first call in the function. Callers: same file by call line, different files by file name."
+          ],
+          "description": "How Call Relation orders children of a node. Can be switched from the Call Relation toolbar."
+        },
+        "contextView.callRelation.edgeStyle": {
+          "type": "string",
+          "default": "arc",
+          "enum": [
+            "elbow",
+            "direct",
+            "arc"
+          ],
+          "enumDescriptions": [
+            "Orthogonal bus lines with arrows.",
+            "Straight single-arrow links from the right edge of the caller to the left edge of the callee.",
+            "Curved single-arrow links using the same attachment points as Direct."
+          ],
+          "description": "Call Relation connector style. Can be switched from the Call Relation toolbar."
+        },
+        "contextView.callRelation.compactFilter": {
+          "type": "boolean",
+          "default": false,
+          "description": "When on, Call Relation keeps only the symbol kinds checked in contextView.callRelation.compactKinds. Off by default. Toggle from the Call Relation toolbar (Slim)."
+        },
+        "contextView.callRelation.compactKinds": {
+          "type": "array",
+          "default": [
+            "function",
+            "method",
+            "constructor",
+            "class",
+            "struct",
+            "variable",
+            "constant",
+            "property"
+          ],
+          "items": {
+            "type": "string",
+            "enum": [
+              "file",
+              "module",
+              "namespace",
+              "package",
+              "class",
+              "method",
+              "property",
+              "field",
+              "constructor",
+              "enum",
+              "interface",
+              "function",
+              "variable",
+              "constant",
+              "string",
+              "number",
+              "boolean",
+              "array",
+              "object",
+              "key",
+              "null",
+              "enumMember",
+              "struct",
+              "event",
+              "operator",
+              "typeParameter"
+            ]
+          },
+          "uniqueItems": true,
+          "description": "Symbol kinds kept when Slim is on. Change them from the list beside the Slim button."
+        },
+        "contextView.callRelation.updateMode": {
+          "type": "string",
+          "description": "Controls how Call Relation is updated when the cursor moves.",
+          "default": "live",
+          "enum": [
+            "live",
+            "sticky"
+          ],
+          "enumDescriptions": [
+            "Follow the cursor. If the language server finds no call hierarchy, show an empty message.",
+            "Keep the last graph until the language server returns a new call hierarchy."
+          ]
+        },
+        "contextView.callRelation.quickOpenIndependent": {
+          "type": "boolean",
+          "default": false,
+          "description": "When on, Search and Open Relation opens the graph in an independent window. When off, it opens beside the editor."
         }
       }
     }
@@ -235,7 +606,8 @@
     "vscode:prepublish": "webpack --mode production",
     "webpack": "webpack --mode development",
     "webpack-dev": "webpack --mode development --watch",
-    "lint": "eslint . --ext .ts,.tsx"
+    "lint": "eslint . --ext .ts,.tsx",
+    "check:mcp": "tsc -p tsconfig.json && node scripts/checkMcpProtocol.js && node scripts/checkMcpConfig.js && node scripts/checkMcpBridge.js"
   },
   "//dependencies-note": "vscode-textmate / vscode-oniguruma 仅在 webview 端打包使用（media/textmate.bundle.js）。",
   "devDependencies": {
@@ -250,6 +622,7 @@
     "webpack-cli": "^4.9.0"
   },
   "dependencies": {
+    "jsonc-parser": "^3.3.1",
     "monaco-editor": "^0.56.0",
     "vscode-oniguruma": "^2.0.1",
     "vscode-textmate": "^9.3.2"

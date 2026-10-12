@@ -27,22 +27,593 @@ body {
     padding-top: 0 !important;
 }
 
+/* 跳转链顶栏：多于 1 条历史时占 22px，并把编辑器/主容器下移。 */
+.jump-trail {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 22px;
+    z-index: 1100;
+    align-items: center;
+    padding: 0 8px;
+    gap: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    box-sizing: border-box;
+    background: var(--vscode-breadcrumb-background, var(--vscode-editor-background));
+    border-bottom: 1px solid var(--vscode-editorWidget-border);
+    color: var(--vscode-breadcrumb-foreground, var(--vscode-descriptionForeground));
+    font-size: 13px;
+}
+.jump-trail:not([hidden]) {
+    display: flex;
+}
+/* #container 是 #main-container 的绝对定位子元素。只下移父级，
+   若再给 #container 设 top:22px 会叠出一条空白。 */
+body.has-jump-trail #main-container {
+    top: 22px;
+    height: calc(100vh - 46px);
+}
+body.has-jump-trail #container {
+    top: 0;
+    height: 100%;
+}
+.jump-trail-sep {
+    flex-shrink: 0;
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    padding: 0;
+    background: currentColor;
+    -webkit-mask: url(codicon-chevron-right.svg) no-repeat center / 16px 16px;
+    mask: url(codicon-chevron-right.svg) no-repeat center / 16px 16px;
+    user-select: none;
+    box-sizing: border-box;
+}
+.jump-trail-item,
+.jump-trail-overflow {
+    flex-shrink: 0;
+    overflow: visible;
+    white-space: nowrap;
+    cursor: pointer;
+    padding: 1px 6px;
+    border-radius: 3px;
+    line-height: 16px;
+    color: var(--vscode-breadcrumb-foreground, var(--vscode-descriptionForeground));
+}
+.jump-trail-item:hover,
+.jump-trail-overflow:hover {
+    color: var(--vscode-breadcrumb-focusForeground, var(--vscode-foreground));
+    background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.15));
+}
+.jump-trail-current,
+.jump-trail-current:hover {
+    cursor: default;
+    color: var(--vscode-breadcrumb-focusForeground, var(--vscode-foreground));
+    background: color-mix(in srgb, var(--vscode-foreground) 10%, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.15)));
+}
+.jump-trail-overflow {
+    letter-spacing: 1px;
+    user-select: none;
+}
+.jump-trail-measure {
+    position: absolute;
+    visibility: hidden;
+    display: flex;
+    align-items: center;
+    white-space: nowrap;
+    pointer-events: none;
+}
+.jump-trail-dropdown {
+    position: fixed;
+    z-index: 3000;
+    min-width: 140px;
+    max-width: min(420px, 80vw);
+    max-height: min(320px, 50vh);
+    overflow-y: auto;
+    background: var(--vscode-menu-background, var(--vscode-editorWidget-background, #252526));
+    color: var(--vscode-menu-foreground, var(--vscode-foreground, #ccc));
+    border: 1px solid var(--vscode-menu-border, var(--vscode-editorWidget-border, #454545));
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.36);
+    padding: 4px 0;
+}
+.jump-trail-dropdown-item {
+    padding: 3px 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    cursor: pointer;
+    font-size: 12px;
+}
+.jump-trail-dropdown-item:hover {
+    background: var(--vscode-list-hoverBackground, rgba(255, 255, 255, 0.08));
+}
+
 /* 性能优化：用 class 切换编辑器光标样式，替代 onMouseMove 中遍历所有 DOM 子节点逐个写 inline style */
+/* 用户点击行行尾 git 摘要：隔一段距离、浅灰斜体，不抢代码颜色。 */
+.monaco-editor .cw-line-blame {
+    margin-left: 6ch;
+    /* GitLens trailing blame：#99999959（约 35% 透明灰）。装了 GitLens 时跟主题走。 */
+    color: var(--vscode-gitlens-trailingLineForegroundColor, #99999959);
+    background: var(--vscode-gitlens-trailingLineBackgroundColor, transparent);
+    opacity: 1;
+    font-family: var(--vscode-editor-font-family, Consolas, monospace);
+    font-style: normal;
+    font-weight: normal;
+    pointer-events: none;
+    user-select: none;
+    white-space: nowrap;
+}
+
+.monaco-editor .cw-line-blame.cw-line-blame-live {
+    pointer-events: auto;
+    cursor: default;
+}
+
+.cw-line-blame-hover {
+    position: fixed;
+    z-index: 10000;
+    display: flex;
+    flex-direction: column;
+    box-sizing: border-box;
+    max-width: min(720px, calc(100vw - 24px));
+    min-width: 520px;
+    width: max-content;
+    max-height: calc(100vh - 16px);
+    overflow: hidden;
+    padding: 16px 16px 14px;
+    background: var(--vscode-editorHoverWidget-background, var(--vscode-editorWidget-background, #252526));
+    color: var(--vscode-editorHoverWidget-foreground, var(--vscode-editorWidget-foreground, #cccccc));
+    border: 1px solid var(--vscode-editorHoverWidget-border, var(--vscode-editorWidget-border, #454545));
+    border-radius: 3px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.36);
+    font-size: 14px;
+    line-height: 1.45;
+    font-family: var(--vscode-font-family, "Segoe UI", sans-serif);
+}
+
+.cw-line-blame-hover-scroll {
+    flex: 0 0 auto;
+}
+
+/* Parent has an explicit height only when content is taller than the free space. */
+.cw-line-blame-hover.is-clip .cw-line-blame-hover-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+
+.cw-line-blame-hover-tips {
+    position: relative;
+    align-self: stretch;
+    width: 100%;
+    box-sizing: border-box;
+    padding-right: 26px;
+}
+
+.cw-line-blame-hover-copy {
+    position: absolute;
+    right: 0;
+    top: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    margin: 0;
+    padding: 0;
+    border: none;
+    border-radius: 3px;
+    cursor: pointer;
+    color: var(--vscode-icon-foreground, #c5c5c5);
+    background: transparent;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+}
+
+.cw-line-blame-hover-copy svg {
+    width: 13px;
+    height: 13px;
+}
+
+.cw-line-blame-hover-detail {
+    position: relative;
+    align-self: stretch;
+    width: 100%;
+    box-sizing: border-box;
+    padding-right: 26px;
+}
+
+.cw-line-blame-hover-rule {
+    flex: 0 0 auto;
+    align-self: stretch;
+    height: 0;
+    margin: 0;
+    border: none;
+    border-top: 1px solid var(--vscode-editorHoverWidget-border, rgba(128, 128, 128, 0.35));
+    pointer-events: none;
+}
+
+.cw-line-blame-hover:hover:not(.is-copy-below) .cw-line-blame-hover-tips > .cw-line-blame-hover-copy,
+.cw-line-blame-hover.is-copy-below .cw-line-blame-hover-detail > .cw-line-blame-hover-copy {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+}
+
+.cw-line-blame-hover-copy:hover {
+    background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+
+.cw-line-blame-hover-copy:active {
+    background: var(--vscode-toolbar-activeBackground, rgba(128, 128, 128, 0.32));
+    transform: translateY(1px);
+}
+
+.cw-line-blame-hover-detail > .cw-line-blame-hover-copy {
+    top: 8px;
+}
+
+.cw-line-blame-hover-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-shrink: 0;
+    gap: 16px;
+    margin-bottom: 8px;
+}
+
+.cw-line-blame-hover-who {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.cw-line-blame-hover-avatar-wrap {
+    position: relative;
+    width: 28px;
+    height: 28px;
+    flex-shrink: 0;
+}
+
+.cw-line-blame-hover-avatar,
+.cw-line-blame-hover-avatar-letter {
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    flex-shrink: 0;
+}
+
+.cw-line-blame-hover-avatar {
+    position: absolute;
+    inset: 0;
+    object-fit: cover;
+}
+
+.cw-line-blame-hover-avatar-letter {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 1;
+}
+
+.cw-line-blame-hover-author {
+    font-weight: 600;
+    font-size: 15px;
+}
+
+.cw-line-blame-hover-when {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--vscode-descriptionForeground, #999);
+    white-space: nowrap;
+}
+
+.cw-line-blame-hover-when-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+}
+
+.cw-line-blame-hover-when-icon svg {
+    display: block;
+    width: 14px;
+    height: 14px;
+}
+
+.cw-line-blame-hover-msg {
+    flex: 0 0 auto;
+    min-height: 0;
+    overflow: visible;
+}
+
+.cw-line-blame-hover-scroll::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+.cw-line-blame-hover-scroll::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.cw-line-blame-hover-scroll::-webkit-scrollbar-thumb {
+    background: var(--vscode-scrollbarSlider-background, rgba(121, 121, 121, 0.4));
+    border-radius: 4px;
+}
+
+.cw-line-blame-hover-scroll::-webkit-scrollbar-thumb:hover {
+    background: var(--vscode-scrollbarSlider-hoverBackground, rgba(100, 100, 100, 0.7));
+}
+
+.cw-line-blame-hover-summary {
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin-bottom: 8px;
+}
+
+.cw-line-blame-hover-body {
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 0 0 8px;
+    color: var(--vscode-descriptionForeground, #999);
+}
+
+/* 提交信息里的链接。平时无下划线；悬停才出下划线 + 手型。 */
+.cw-line-blame-hover-msg a.cw-line-blame-hover-link {
+    cursor: pointer !important;
+    color: var(--vscode-textLink-foreground, #3794ff);
+    text-decoration: none;
+    word-break: break-all;
+}
+
+.cw-line-blame-hover-msg a.cw-line-blame-hover-link:hover {
+    color: var(--vscode-textLink-activeForeground, #4daafc);
+    text-decoration: underline;
+}
+
+.cw-line-blame-hover-foot {
+    flex-shrink: 0;
+}
+
+.cw-line-blame-hover-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 4px 0 8px;
+    flex-shrink: 0;
+}
+
+.cw-line-blame-hover-diff {
+    flex: 0 0 auto;
+    height: auto;
+    overflow: visible;
+    margin: 0 0 8px;
+    padding-top: 8px;
+    width: 100%;
+    align-self: stretch;
+    box-sizing: border-box;
+    border: none;
+    border-radius: 0;
+    font-family: var(--vscode-editor-font-family, Consolas, monospace);
+    font-size: 12px;
+    line-height: 1.45;
+    tab-size: 4;
+}
+
+.cw-line-blame-hover-diff-line {
+    display: block;
+    padding: 1px 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+
+/* + / - 同色：当前主题操作符（keyword.operator）；解析失败时用 Light+ / Dark+ 偏紫兜底 */
+.cw-line-blame-hover-diff-mark {
+    display: inline;
+    user-select: none;
+    font-weight: 600;
+    color: var(--cw-operator-foreground, #800080);
+}
+
+.vscode-dark .cw-line-blame-hover-diff-mark,
+.vscode-high-contrast:not(.vscode-high-contrast-light) .cw-line-blame-hover-diff-mark {
+    color: var(--cw-operator-foreground, #C586C0);
+}
+
+.cw-line-blame-hover-diff-text {
+    display: inline;
+}
+
+.cw-line-blame-hover-diff-del {
+    background: transparent;
+    color: var(--vscode-gitDecoration-deletedResourceForeground, #ad0707);
+}
+
+.cw-line-blame-hover-diff-add {
+    background: transparent;
+    /* 对齐 GitLens hover ```diff``` 的 markup.inserted（Light+ #16825D / Dark #3fb950） */
+    color: #16825D;
+}
+
+.vscode-dark .cw-line-blame-hover-diff-add,
+.vscode-high-contrast:not(.vscode-high-contrast-light) .cw-line-blame-hover-diff-add {
+    color: #3fb950;
+}
+
+.cw-line-blame-hover-diff-ctx {
+    color: var(--vscode-descriptionForeground, #999);
+}
+
+.cw-line-blame-hover-diff-inner {
+    background: transparent;
+}
+
+.cw-line-blame-hover-sha {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-family: var(--vscode-editor-font-family, Consolas, monospace);
+    font-size: 13px;
+    padding: 3px 8px 3px 6px;
+    border: none;
+    border-radius: 3px;
+    cursor: pointer;
+    color: #16825D;
+    background: color-mix(in srgb, #16825D 16%, transparent);
+}
+
+.cw-line-blame-hover-sha-git {
+    display: block;
+    width: 12px;
+    height: 12px;
+    flex-shrink: 0;
+}
+
+.vscode-dark .cw-line-blame-hover-sha,
+.vscode-high-contrast:not(.vscode-high-contrast-light) .cw-line-blame-hover-sha {
+    color: #3fb950;
+    background: color-mix(in srgb, #3fb950 22%, transparent);
+}
+
+.cw-line-blame-hover-sha:hover {
+    background: color-mix(in srgb, #16825D 26%, transparent);
+}
+
+.cw-line-blame-hover-sha:active {
+    background: color-mix(in srgb, #16825D 38%, transparent);
+    transform: translateY(1px);
+}
+
+.vscode-dark .cw-line-blame-hover-sha:hover,
+.vscode-high-contrast:not(.vscode-high-contrast-light) .cw-line-blame-hover-sha:hover {
+    background: color-mix(in srgb, #3fb950 32%, transparent);
+}
+
+.vscode-dark .cw-line-blame-hover-sha:active,
+.vscode-high-contrast:not(.vscode-high-contrast-light) .cw-line-blame-hover-sha:active {
+    background: color-mix(in srgb, #3fb950 44%, transparent);
+}
+
+.cw-line-blame-hover-sha-current,
+.vscode-dark .cw-line-blame-hover-sha-current,
+.vscode-high-contrast:not(.vscode-high-contrast-light) .cw-line-blame-hover-sha-current {
+    color: var(--vscode-descriptionForeground, #6a6a6a);
+    background: color-mix(in srgb, var(--vscode-descriptionForeground, #9d9d9d) 18%, transparent);
+}
+
+.cw-line-blame-hover-sha-current:hover,
+.vscode-dark .cw-line-blame-hover-sha-current:hover,
+.vscode-high-contrast:not(.vscode-high-contrast-light) .cw-line-blame-hover-sha-current:hover {
+    background: color-mix(in srgb, var(--vscode-descriptionForeground, #9d9d9d) 28%, transparent);
+}
+
+.cw-line-blame-hover-sha-current:active,
+.vscode-dark .cw-line-blame-hover-sha-current:active,
+.vscode-high-contrast:not(.vscode-high-contrast-light) .cw-line-blame-hover-sha-current:active {
+    background: color-mix(in srgb, var(--vscode-descriptionForeground, #9d9d9d) 38%, transparent);
+    transform: translateY(1px);
+}
+
+.cw-line-blame-hover-changes {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px;
+    color: var(--vscode-descriptionForeground, #999);
+    font-size: 13px;
+    padding-top: 6px;
+    /* Stretch the rule to the card edge; detail keeps 26px for the copy button. */
+    margin-right: -26px;
+    padding-right: 26px;
+    border-top: 1px solid var(--vscode-editorHoverWidget-border, rgba(128, 128, 128, 0.35));
+}
+
+.cw-line-blame-hover-changes .cw-line-blame-hover-sha {
+    font-size: 13px;
+    padding: 1px 6px;
+}
+
+.cw-line-blame-hover-sep {
+    display: inline-flex;
+    align-items: center;
+    font-size: 18px;
+    line-height: 1;
+    font-weight: 600;
+    padding: 0 2px;
+    /* ↔ sits low in the em box; lift it to the SHA pill midline. */
+    transform: translateY(-2px);
+}
+
+.cw-line-blame-hover-open-changes {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    margin-left: 2px;
+    padding: 0;
+    border: none;
+    border-radius: 3px;
+    cursor: pointer;
+    color: var(--vscode-icon-foreground, #c5c5c5);
+    background: transparent;
+}
+
+.cw-line-blame-hover-open-changes svg {
+    width: 16px;
+    height: 16px;
+}
+
+.cw-line-blame-hover-open-changes:hover {
+    background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+
 .cw-cursor-pointer, .cw-cursor-pointer * { cursor: pointer !important; }
 .cw-cursor-default, .cw-cursor-default * { cursor: default !important; }
 
+/* Sticky Scroll（粘附行）悬停手型，与 VSCode 一致。
+   Monaco 自带 `.sticky-widget .sticky-line-content:hover { cursor: pointer }`，
+   但上面的 `.cw-cursor-default *` 带 !important 且作用于编辑器全部后代，会把粘附行压成箭头
+   （鼠标在粘附行上时 onMouseMove 的 isOverText 恒为 false，必然打上 cw-cursor-default）。
+   这里用更高特异性 + !important 让粘附行恢复手型；行号列不加规则，保持默认箭头（同 VSCode）。 */
 .monaco-editor .sticky-widget .sticky-line-content:hover,
 .monaco-editor .sticky-widget .sticky-line-content:hover * {
     cursor: pointer !important;
 }
 
+/* Sticky Scroll：Ctrl/Cmd + 悬停粘附行 token 时的「可点击跳定义」下划线，对齐 VSCode
+   （VSCode 在粘附行上直接写 style.textDecoration = 'underline'）。
+   刻意只加下划线、不改字重/字号：粘附行由 renderViewLine 绝对定位渲染，
+   字宽一变就会与 characterMapping 错位、导致文字跳动和取词偏移。 */
 .monaco-editor .sticky-widget .cw-sticky-link {
     text-decoration: underline !important;
     text-underline-offset: 2px;
 }
 
-/* Sticky Scroll selection is rendered separately because sticky lines do not
-   participate in Monaco's normal selection layer. */
+/* Sticky Scroll：右键选词 / 左键拖选在粘附区的可见反馈。
+   粘附行不渲染 selection 层（选区由正文区的 selections 层画），所以自己插入绝对定位的覆盖层来画。
+   用覆盖层而非给 token span 上底色，才能做到字符级——选到 token 中间也能精确停住。
+   覆盖层挂在 .sticky-widget-lines 上（不能插进 .sticky-line-content：Monaco 靠 previousSibling
+   计数得出 partIndex，行内插节点会让列号错位）；left/width/top/height/z-index 均由 JS 按所属行算出
+   （各粘附行绝对定位且互相重叠、靠 z-index 分层，覆盖层必须跟随所属行的层级，否则会被上层行的
+   不透明背景整块盖住——那正是「只有最后一行的选中可见」的原因）。
+   pointer-events: none 保证不干扰命中判定。
+   颜色由 JS 写在粘附行根节点的 --cw-sticky-selection-bg 上，取自插件配置的 selectionBackground，
+   与正文区选中色同源（半透明，不挡文字）；变量缺失时回退到 VSCode 主题的选中色。 */
 .monaco-editor .sticky-widget .cw-sticky-selection {
     position: absolute;
     pointer-events: none;
@@ -59,6 +630,17 @@ body {
 .monaco-editor .monaco-scrollable-element .scrollbar.horizontal {
     height: 12px !important; /* 滚动条容器高度 */
     bottom: 0 !important;
+}
+
+/* main.css 早于 Monaco 的 findWidget.css，同优先级会被盖掉。
+   只补边框/阴影/上沿空隙，不改内部 padding，避免输入区和按钮偏下。 */
+body .monaco-editor .find-widget {
+    overflow: visible !important;
+    margin-top: 8px !important;
+    padding: 0 4px 0 9px !important;
+    border: 1px solid var(--vscode-editorWidget-border, rgba(0, 0, 0, 0.18)) !important;
+    border-radius: 6px !important;
+    box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.16)) !important;
 }
 
 #main {
@@ -79,6 +661,7 @@ body {
     top: 0;
     left: 0;
     right: 0;
+    overflow: hidden;
 }
 
 #definition-list {
@@ -309,6 +892,8 @@ body {
     left: 0;
     right: 0;
     height: 24px;
+    box-sizing: border-box;
+    overflow: visible;
     background-color: var(--vscode-editor-background);
     border-top: 1px solid var(--vscode-editorWidget-border);
     display: flex;
@@ -396,75 +981,242 @@ body {
 .nav-jump:hover::before {
     opacity: 1;
 }
-/* 底部导航栏的开关指示器：纯文本。字体颜色与底部文件名（contextView.ts）一致。
-   显示策略：本会话「曾开启过」才显示（.revealed，见下）；关闭 = 暗淡，开启 = 全不透明 + 绿勾。 */
-.si-indicator {
-    display: none; /* 默认隐藏；仅当底部有文件名显示（body.ctx-has-file）时才显示 */
-    position: relative; /* 供开启态右下角 ✓ 定位 */
-    margin-left: auto;  /* 推到底部导航栏最右端 */
-    margin-right: 12px; /* 与窗口右边缘留出间距 */
+/* 右侧三个芯片共用同一 gap，避免各自 margin/padding 把两段空隙拉开、对不齐。 */
+.nav-mode-cluster {
+    margin-left: 0;
+    margin-right: 10px;
+    display: flex;
     align-items: center;
-    height: 100%;
+    gap: 2px;
+    height: 24px;
+    flex-shrink: 0;
+}
+/* 底栏 Update Mode / Jump Mode：图标+文字，间距贴近 VS Code 状态栏。 */
+.update-mode,
+.jump-mode {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    height: 24px;
+    padding: 0 4px;
+    cursor: pointer;
+    user-select: none;
+    flex-shrink: 0;
+    font-size: 12px;
+    font-family: inherit;
+    font-weight: normal;
+    font-style: normal;
+    line-height: 1;
+    color: var(--vscode-descriptionForeground);
+    white-space: nowrap;
+    border-radius: 3px;
+    box-sizing: border-box;
+}
+.update-mode {
+    margin: 0;
+}
+.jump-mode {
+    margin: 0;
+    overflow: visible;
+}
+.update-mode:hover,
+.jump-mode:hover,
+.jump-mode.open,
+.si-indicator:hover,
+.nav-view-toggle:hover,
+.nav-refresh:hover {
+    background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.15));
+}
+.nav-view-toggles {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    height: 24px;
+    flex-shrink: 0;
+}
+.nav-view-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 24px;
+    padding: 0 4px;
+    border-radius: 3px;
+    box-sizing: border-box;
+    cursor: pointer;
+    user-select: none;
+    color: var(--vscode-descriptionForeground);
+}
+.nav-view-toggle svg {
+    display: block;
+    width: 14px;
+    height: 14px;
+    opacity: 0.4;
+}
+.nav-view-toggle.is-on svg {
+    opacity: 1;
+}
+.nav-refresh {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 24px;
+    padding: 0 4px;
+    border-radius: 3px;
+    box-sizing: border-box;
+    cursor: pointer;
+    user-select: none;
+    color: var(--vscode-descriptionForeground);
+}
+.nav-refresh svg {
+    display: block;
+    width: 14px;
+    height: 14px;
+    opacity: 0.85;
+}
+.update-mode-label,
+.jump-mode-label {
+    pointer-events: none;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+}
+.update-mode-label {
+    position: relative;
+    display: inline-block;
+}
+.update-mode-sizer {
+    display: block;
+    visibility: hidden;
+    pointer-events: none;
+}
+.update-mode-text {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.jump-mode > .nav-mode-icon,
+.update-mode > .nav-mode-icon {
+    transform: none;
+}
+.nav-mode-icon {
+    display: flex;
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+    pointer-events: none;
+}
+.nav-mode-icon svg {
+    display: block;
+    width: 14px;
+    height: 14px;
+    fill: currentColor;
+}
+.jump-mode-menu {
+    position: fixed;
+    z-index: 9999;
+    min-width: 220px;
+    background: var(--vscode-menu-background, var(--vscode-editorWidget-background, #fff));
+    color: var(--vscode-menu-foreground, var(--vscode-foreground, #333));
+    border: 1px solid var(--vscode-menu-border, var(--vscode-editorWidget-border, #ccc));
+    border-radius: 4px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+    padding: 4px 0;
+    font-size: 13px;
+    font-family: var(--vscode-font-family, "Segoe UI", Arial, sans-serif);
+    user-select: none;
+}
+.jump-mode-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 12px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.jump-mode-menu-item .nav-mode-icon {
+    width: 14px;
+    height: 14px;
+}
+.jump-mode-menu-item .nav-mode-icon svg {
+    width: 14px;
+    height: 14px;
+}
+.jump-mode-menu-item:hover {
+    background: var(--vscode-menu-selectionBackground, #1d8705);
+    color: var(--vscode-menu-selectionForeground, #fff);
+}
+/* 底部导航栏开关：Codicon 括号。始终显示；关闭红叉，开启绿勾。 */
+.si-indicator {
+    display: flex;
+    position: relative;
+    margin: 0;
+    align-items: center;
+    justify-content: center;
+    height: 24px;
+    padding: 0 4px;
+    border-radius: 3px;
+    box-sizing: border-box;
     cursor: pointer;
     user-select: none;
     font-size: 15px;
-    /* 更细更瘦：用 UI 字体（支持细字重）+ 细字重 + 收紧字距，使 { } 笔画纤细、间距紧凑 */
-    font-family: var(--vscode-font-family, 'Segoe UI', system-ui, sans-serif);
-    font-weight: 400;
-    letter-spacing: -1px;
     line-height: 1;
     color: var(--vscode-descriptionForeground);
-    opacity: 0.45; /* 关闭态：暗淡 */
     transition: color 0.15s ease, opacity 0.15s ease;
 }
-.si-indicator.revealed {
-    display: flex; /* 与文件名显示无关：初始化时配置已开、或本会话曾开启过（.revealed）即显示 { } */
+.si-indicator .si-indicator-braces {
+    opacity: 0.45;
 }
-.si-indicator:hover {
+.si-indicator:hover .si-indicator-braces {
     opacity: 0.8;
 }
-.si-indicator.enabled {
-    /* 开启态：全不透明（保持纤细，不加粗） */
+.si-indicator.enabled .si-indicator-braces {
     opacity: 1;
-    color: var(--vscode-descriptionForeground);
 }
-/* 开启态：在 { } 右下角叠加一个绿色对勾（仅对勾着色，其余透明），提高开/关辨识度 */
-.si-indicator.enabled::after {
-    content: '✓'; /* U+2713 文本型对勾，可被 color 染色，不会渲染成彩色表情方块 */
-    position: absolute;
-    right: -5px;
-    bottom: 0;
-    font-size: 10px;
-    font-weight: 900;
-    line-height: 1;
-    letter-spacing: 0;
-    color: #12e02f; /* 鲜绿对勾 */
-    -webkit-text-stroke: 0.3px #12e02f; /* 略加描边让对勾更粗更显眼 */
-    pointer-events: none;
+.si-indicator-icon {
+    display: block;
+    width: 16px;
+    height: 16px;
+}
+.si-indicator-badge circle {
+    fill: #c42b1c;
+}
+.si-badge-check {
+    display: none;
+}
+.si-indicator.enabled .si-badge-check {
+    display: block;
+}
+.si-indicator.enabled .si-badge-x {
+    display: none;
+}
+.si-indicator.enabled .si-indicator-badge circle {
+    fill: #16825D;
+}
+.vscode-dark .si-indicator-badge circle,
+.vscode-high-contrast:not(.vscode-high-contrast-light) .si-indicator-badge circle {
+    fill: #f14c4c;
+}
+.vscode-dark .si-indicator.enabled .si-indicator-badge circle,
+.vscode-high-contrast:not(.vscode-high-contrast-light) .si-indicator.enabled .si-indicator-badge circle {
+    fill: #2ea043;
 }
 /* 添加双击区域样式 */
 .double-click-area {
-    position: fixed;
-    bottom: 0; /* 与导航栏高度一致 */
-    /* 文件名固定紧贴上箭头（{ } 指示器已移到导航栏最右端，不再占用此处空间）。
-       上箭头右缘约 108px，留出小间距。 */
-    left: 114px;
-    right: 0;
+    flex: 1;
+    min-width: 0;
     height: 24px;
-    z-index: 1001;
     cursor: default;
-    background-color: transparent; /* 使用透明背景，与导航栏一致 */
+    background-color: transparent;
     display: flex;
-    align-items: left;
-    justify-content: left;
+    align-items: center;
+    justify-content: flex-start;
     color: var(--vscode-descriptionForeground);
     font-size: 14px;
     font-style: italic;
     padding-left: 6px;
-}
-/* { } 指示器显示在导航栏最右端时：文件名区右侧让位，避免其铺满的透明区遮挡对 { } 的点击 */
-body.si-revealed .double-click-area {
-    right: 32px;
+    box-sizing: border-box;
 }
 /* 添加文件名显示样式 */
 .filename-display {
@@ -526,56 +1278,6 @@ body.si-revealed .double-click-area {
     flex: 1;
     padding: 0;
 }
-.double-click-area {
-    align-items: center;
-    justify-content: flex-start;
-    padding: 0 10px;
-    box-sizing: border-box;
-    overflow: hidden;
-}
-
-.filename-display {
-    width: 100%;
-    min-width: 0;
-    gap: 12px;
-}
-
-.filename-text {
-    max-width: 240px;
-    flex-shrink: 0;
-}
-
-.filename-path {
-    align-items: center;
-    margin-left: 0;
-    overflow-x: auto;
-    overflow-y: hidden;
-    scrollbar-width: thin;
-    scrollbar-color: var(--vscode-scrollbarSlider-background) transparent;
-}
-
-.filename-path-text {
-    overflow: visible;
-    text-overflow: clip;
-    flex: 0 0 auto;
-}
-
-.filename-path::-webkit-scrollbar {
-    height: 6px;
-}
-
-.filename-path::-webkit-scrollbar-track {
-    background: transparent;
-}
-
-.filename-path::-webkit-scrollbar-thumb {
-    background: rgba(128, 128, 128, 0.35);
-    border-radius: 3px;
-}
-
-.filename-path:hover::-webkit-scrollbar-thumb {
-    background: rgba(128, 128, 128, 0.55);
-}
 .custom-context-menu {
     position: fixed;
     background: #ffffff;/*var(--vscode-menu-background, #fff);*/
@@ -592,15 +1294,55 @@ body.si-revealed .double-click-area {
 }
 
 .custom-context-menu-item {
+    position: relative;
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
     padding: 3px 24px 3px 16px;
     cursor: pointer;
     white-space: nowrap;
     transition: background 0.2s;
 }
 
+.custom-context-menu-item.is-checked::before {
+    content: "\2713";
+    position: absolute;
+    left: 4px;
+}
+
+.custom-context-menu-label {
+    min-width: 0;
+}
+
+.custom-context-menu-detail {
+    margin-left: auto;
+    color: #6a6a6a;
+    font-size: 12px;
+}
+
+.custom-context-menu-item:hover .custom-context-menu-detail {
+    color: #e8f5e4;
+}
+
+.custom-context-menu-heading {
+    padding: 2px 16px;
+    color: #6a6a6a;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
 .custom-context-menu-item:hover {
     background: #1d8705;/* var(--vscode-menu-selectionBackground, #e5f3ff); */
     color: #ffffff;/* var(--vscode-menu-selectionForeground, #000); */
+}
+
+.custom-context-menu-item.is-disabled,
+.custom-context-menu-item.is-disabled:hover {
+    cursor: default;
+    opacity: 0.45;
+    background: transparent;
+    color: inherit;
 }
 
 .custom-context-menu-separator {

@@ -10,7 +10,217 @@
     function init() {
         setupNavigation();
         setupDoubleClickArea();
+        setupJumpMode();
+        setupUpdateMode();
         setupSiIndicator();
+        setupViewToggles();
+        setupRefreshButton();
+    }
+
+    const NAV_ICONS = {
+        live: '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 3C4.67 3 1.82 5.07 1 8c.82 2.93 3.67 5 7 5s6.18-2.07 7-5c-.82-2.93-3.67-5-7-5zm0 8a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm0-1.5A1.5 1.5 0 1 0 8 6a1.5 1.5 0 0 0 0 3z"/></svg>',
+        sticky: '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 3C4.67 3 1.82 5.07 1 8c.82 2.93 3.67 5 7 5s6.18-2.07 7-5c-.82-2.93-3.67-5-7-5zm0 8a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm0-1.5A1.5 1.5 0 1 0 8 6a1.5 1.5 0 0 0 0 3z"/><path fill="currentColor" d="M1.15 2.85 13.15 14.85l.7-.7L1.85 2.15l-.7.7z"/></svg>',
+        definition: '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M3 2h7v1H4v9h9V8h1v5H3V2zm6.15 0H14v4.85h-1V3.7L7.85 8.85l-.7-.7L12.3 3h-3.15V2z"/></svg>',
+        typeDefinition: '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M3 2h10v12H3V2zm1 1v2.2h8V3H4zm0 3.2V13h8V6.2H4zM6.2 8h3.6v1H6.2V8z"/></svg>',
+        implementation: '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M2 4h8v10H2V4zm1 1v8h6V5H3zm3-2h8v10h-1V4H6V3z"/></svg>',
+        references: '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M2 3h12v1.25H2V3zm0 4.4h12v1.25H2V7.4zm0 4.35h8v1.25H2v-1.25z"/></svg>',
+        relation: '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" transform="translate(-8 0)" d="M11 2C12.1046 2 13 2.89543 13 4V6.00469C13 6.53494 13.0077 6.79889 13.0891 7.00209C13.1517 7.15835 13.2842 7.33309 13.7236 7.55276C13.893 7.63745 14 7.81058 14 7.99997C14 8.18935 13.893 8.36249 13.7236 8.44719C13.2843 8.66685 13.1519 8.84151 13.0892 8.99819C13.0077 9.20211 13 9.46732 13 10V12C13 13.1046 12.1046 14 11 14C10.7239 14 10.5 13.7761 10.5 13.5C10.5 13.2239 10.7239 13 11 13C11.5523 13 12 12.5523 12 12L12 9.94145C11.9997 9.49235 11.9994 9.03033 12.1608 8.6268C12.2579 8.384 12.4035 8.17962 12.5993 8.00002C12.4035 7.82057 12.258 7.61645 12.1609 7.37408C11.9993 6.971 11.9997 6.51001 12 6.063L12 4C12 3.44772 11.5523 3 11 3C10.7239 3 10.5 2.77614 10.5 2.5C10.5 2.22386 10.7239 2 11 2Z"/><path fill="currentColor" d="M8 7h4v2H8z"/><path fill="currentColor" d="M11 5l4 3-4 3V9h-1V7h1V5z"/></svg>',
+        refresh: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.2 8A5.2 5.2 0 1 1 8 2.8"/><path d="M8 1.2 10.4 3.2 8 5.2"/></svg>',
+        jumpTrail: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="19" r="3"/><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/><circle cx="18" cy="5" r="3"/></svg>',
+        lineBlame: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M3 12h6"/><path d="M15 12h6"/></svg>',
+        hoverTips: '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M14.5 2h-13l-.5.5v9l.5.5H4v2.5l.854.146L7.207 12H14.5l.5-.5v-9l-.5-.5zm-.5 9H6.793L5 12.793V11H2V3h12v8z"/></svg>',
+        stickyScroll: '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.2" y="2.75" width="10.1" height="1" rx=".5" fill="currentColor"/><rect x="1.2" y="6.7" width="5.35" height="1" rx=".5" fill="currentColor"/><rect x="1.2" y="10.65" width="3.45" height="1" rx=".5" fill="currentColor"/><g fill="currentColor" transform="translate(11.15 9.55) rotate(40) scale(1.28)"><circle cx="0" cy="-2.25" r="1.55"/><path d="M-2 .25 2 .25 1.1-1.7h-2.2z"/><rect x="-.45" y=".2" width=".9" height="4.2" rx=".45"/></g></svg>'
+    };
+
+    function setNavIcon(el, key) {
+        if (el) {
+            el.innerHTML = NAV_ICONS[key] || '';
+        }
+    }
+
+    // 底栏右侧跳转模式：点击上拉 Definition / Type Definition / Implementation / References。
+    function setupJumpMode() {
+        const JUMP_MODE_ITEMS = [
+            { id: 'definition', label: 'Definition', short: 'Definition', title: 'Go to Definition (default)' },
+            { id: 'typeDefinition', label: 'Type Definition', short: 'Type Definition', title: 'Go to Type Definition' },
+            { id: 'implementation', label: 'Implementation', short: 'Implementation', title: 'Go to Implementation' },
+            { id: 'references', label: 'References', short: 'References', title: 'List references and open in Context' },
+            { id: 'relation', label: 'Relation', short: 'Relation', title: 'List callers and open in Context' }
+        ];
+
+        function currentMode() {
+            const cfg = (window.vsCodeEditorConfiguration && window.vsCodeEditorConfiguration.contextEditorCfg) || {};
+            const mode = cfg.jumpMode;
+            return JUMP_MODE_ITEMS.some(item => item.id === mode) ? mode : 'definition';
+        }
+
+        function modeItem(id) {
+            return JUMP_MODE_ITEMS.find(item => item.id === id) || JUMP_MODE_ITEMS[0];
+        }
+
+        window.updateJumpMode = function() {
+            const btn = document.getElementById('jump-mode');
+            const label = document.getElementById('jump-mode-label');
+            const item = modeItem(currentMode());
+            if (label) {
+                label.textContent = item.short;
+            }
+            setNavIcon(document.getElementById('jump-mode-icon'), item.id);
+            if (btn) {
+                btn.title = 'Jump mode: ' + item.title;
+            }
+        };
+
+        let onDocDown = null;
+
+        function closeMenu() {
+            const menu = document.getElementById('jump-mode-menu');
+            if (menu) {
+                menu.remove();
+            }
+            const btn = document.getElementById('jump-mode');
+            if (btn) {
+                btn.classList.remove('open');
+            }
+            if (onDocDown) {
+                document.removeEventListener('mousedown', onDocDown, true);
+                onDocDown = null;
+            }
+        }
+
+        function openMenu() {
+            const btn = document.getElementById('jump-mode');
+            if (!btn) {
+                return;
+            }
+            if (document.getElementById('jump-mode-menu')) {
+                closeMenu();
+                return;
+            }
+
+            const menu = document.createElement('div');
+            menu.id = 'jump-mode-menu';
+            menu.className = 'jump-mode-menu';
+            const selected = currentMode();
+            JUMP_MODE_ITEMS.forEach(item => {
+                const el = document.createElement('div');
+                el.className = 'jump-mode-menu-item' + (item.id === selected ? ' selected' : '');
+                el.title = item.title;
+                const icon = document.createElement('span');
+                icon.className = 'nav-mode-icon';
+                setNavIcon(icon, item.id);
+                const text = document.createElement('span');
+                text.textContent = (item.id === selected ? '✔ ' : '') + item.label;
+                el.appendChild(icon);
+                el.appendChild(text);
+                el.addEventListener('mousedown', e => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    closeMenu();
+                    if (item.id === selected) {
+                        return;
+                    }
+                    const label = document.getElementById('jump-mode-label');
+                    if (label) {
+                        label.textContent = item.short;
+                    }
+                    setNavIcon(document.getElementById('jump-mode-icon'), item.id);
+                    btn.title = 'Jump mode: ' + item.title;
+                    window.vscode.postMessage({ type: 'setJumpMode', mode: item.id });
+                });
+                menu.appendChild(el);
+            });
+            menu.addEventListener('contextmenu', e => {
+                e.preventDefault();
+                e.stopPropagation();
+            });
+            document.body.appendChild(menu);
+            btn.classList.add('open');
+
+            const rect = btn.getBoundingClientRect();
+            const menuRect = menu.getBoundingClientRect();
+            let left = rect.right - menuRect.width;
+            let top = rect.top - menuRect.height - 4;
+            if (left < 4) {
+                left = 4;
+            }
+            if (top < 4) {
+                top = rect.bottom + 4;
+            }
+            menu.style.left = left + 'px';
+            menu.style.top = top + 'px';
+
+            onDocDown = (e) => {
+                if (btn.contains(e.target) || menu.contains(e.target)) {
+                    return;
+                }
+                closeMenu();
+            };
+            document.addEventListener('mousedown', onDocDown, true);
+            window.addEventListener('blur', function onBlur() {
+                closeMenu();
+                window.removeEventListener('blur', onBlur);
+            });
+        }
+
+        const btn = document.getElementById('jump-mode');
+        if (btn) {
+            btn.addEventListener('click', e => {
+                e.preventDefault();
+                e.stopPropagation();
+                openMenu();
+            });
+            btn.addEventListener('contextmenu', e => {
+                e.preventDefault();
+                e.stopPropagation();
+            });
+        }
+
+        window.updateJumpMode();
+    }
+
+    // 底栏 Update Mode：点击在 Live / Sticky 之间切换，不展开列表。
+    function setupUpdateMode() {
+        function currentMode() {
+            const cfg = (window.vsCodeEditorConfiguration && window.vsCodeEditorConfiguration.contextEditorCfg) || {};
+            return cfg.updateMode === 'sticky' ? 'sticky' : 'live';
+        }
+
+        function paintUpdateMode(sticky) {
+            const btn = document.getElementById('update-mode');
+            const text = document.getElementById('update-mode-text');
+            if (text) {
+                text.textContent = sticky ? 'Sticky' : 'Live';
+            }
+            setNavIcon(document.getElementById('update-mode-icon'), sticky ? 'sticky' : 'live');
+            if (btn) {
+                btn.classList.toggle('is-sticky', sticky);
+                btn.title = sticky
+                    ? 'Update mode: Sticky — keep last context until a new symbol is found'
+                    : 'Update mode: Live — clear when no symbol is found at the cursor';
+            }
+        }
+
+        window.updateUpdateMode = function() {
+            paintUpdateMode(currentMode() === 'sticky');
+        };
+
+        const btn = document.getElementById('update-mode');
+        if (btn) {
+            btn.addEventListener('click', e => {
+                e.preventDefault();
+                e.stopPropagation();
+                const next = currentMode() === 'sticky' ? 'live' : 'sticky';
+                paintUpdateMode(next === 'sticky');
+                window.vscode.postMessage({ type: 'setUpdateMode', value: next });
+            });
+            btn.addEventListener('contextmenu', e => {
+                e.preventDefault();
+                e.stopPropagation();
+            });
+        }
+
+        window.updateUpdateMode();
     }
 
     // 底部导航栏右侧 {si} 指示器：标识「双击选中整对括号/引号」开关状态，点击切换。
@@ -22,25 +232,25 @@
         window.updateSiIndicator = function() {
             const cfg = (window.vsCodeEditorConfiguration && window.vsCodeEditorConfiguration.contextEditorCfg) || {};
             const on = !!cfg.doubleClickSelectsBracketPair;
-            // 记录到 window，供底部栏右键菜单显示勾选状态
             window.selectBracketPairEnabled = on;
-            // 显示策略：启动时若配置未开则不显示；只要本次会话「开启过一次」，之后即使再关闭也保持显示，
-            // 直到 VSCode 重启（webview 重建时 window.siEverEnabled 自然重置为 undefined）。
-            if (on) { window.siEverEnabled = true; }
-            // body.si-revealed 同步给布局用：{ } 显示在导航栏最右端时，文件名区右侧让位以免遮挡其点击。
-            document.body.classList.toggle('si-revealed', !!window.siEverEnabled);
             if (!siIndicator) { return; }
-            // .revealed 作为显示闸门（配合 CSS）；.enabled 仅区分当前开/关外观
-            siIndicator.classList.toggle('revealed', !!window.siEverEnabled);
             siIndicator.classList.toggle('enabled', on);
             siIndicator.title = on
                 ? 'Double-click selects the whole bracket/quote pair (including delimiters): ON — click to disable'
                 : 'Double-click selects the whole bracket/quote pair (including delimiters): OFF — click to enable';
         };
 
+        window.flipSelectBracketPair = function() {
+            const root = window.vsCodeEditorConfiguration || (window.vsCodeEditorConfiguration = {});
+            const cfg = root.contextEditorCfg || (root.contextEditorCfg = {});
+            cfg.doubleClickSelectsBracketPair = !cfg.doubleClickSelectsBracketPair;
+            window.updateSiIndicator();
+            window.vscode.postMessage({ type: 'toggleSelectBracketPair' });
+        };
+
         if (siIndicator) {
             siIndicator.addEventListener('click', () => {
-                window.vscode.postMessage({ type: 'toggleSelectBracketPair' });
+                window.flipSelectBracketPair();
             });
             // 该指示器区域禁用浏览器原生右键菜单，避免误触
             siIndicator.addEventListener('contextmenu', e => {
@@ -51,6 +261,92 @@
 
         // 用初始下发的配置渲染一次
         window.updateSiIndicator();
+    }
+
+    function setupViewToggles() {
+        const items = [
+            {
+                id: 'toggle-jump-trail',
+                icon: 'jumpTrail',
+                on: () => !!window.jumpTrailEnabled,
+                title: on => on
+                    ? 'Jump Trail: ON — click to hide the hop trail'
+                    : 'Jump Trail: OFF — click to show the hop trail',
+                flip: () => window.postMessage({ type: 'JumpTrail' })
+            },
+            {
+                id: 'toggle-sticky-scroll',
+                icon: 'stickyScroll',
+                on: () => !!window.stickyScroll,
+                title: on => on
+                    ? 'Sticky Scroll: ON — click to hide sticky lines'
+                    : 'Sticky Scroll: OFF — click to show sticky lines',
+                flip: () => window.postMessage({ type: 'StickyScroll' })
+            },
+            {
+                id: 'toggle-line-blame',
+                icon: 'lineBlame',
+                on: () => !!window.lineBlameEnabled,
+                title: on => on
+                    ? 'Git Line Blame: ON — click to hide line summaries'
+                    : 'Git Line Blame: OFF — click to show line summaries',
+                flip: () => window.postMessage({ type: 'LineBlame' })
+            },
+            {
+                id: 'toggle-hover-tips',
+                icon: 'hoverTips',
+                on: () => !!window.enableHover,
+                title: on => on
+                    ? 'Hover Tips: ON — click to hide editor hover'
+                    : 'Hover Tips: OFF — click to show editor hover',
+                flip: () => window.postMessage({ type: 'EnableHover' })
+            }
+        ];
+
+        window.updateViewToggles = function() {
+            for (const item of items) {
+                const el = document.getElementById(item.id);
+                if (!el) {
+                    continue;
+                }
+                const on = item.on();
+                el.classList.toggle('is-on', on);
+                el.title = item.title(on);
+                el.setAttribute('aria-pressed', on ? 'true' : 'false');
+            }
+        };
+
+        for (const item of items) {
+            const el = document.getElementById(item.id);
+            if (!el) {
+                continue;
+            }
+            setNavIcon(el, item.icon);
+            el.addEventListener('click', () => {
+                item.flip();
+            });
+            el.addEventListener('contextmenu', e => {
+                e.preventDefault();
+                e.stopPropagation();
+            });
+        }
+        window.updateViewToggles();
+    }
+
+    function setupRefreshButton() {
+        const el = document.getElementById('nav-refresh');
+        if (!el) {
+            return;
+        }
+        setNavIcon(el, 'refresh');
+        el.title = 'Refresh the file shown in Context';
+        el.addEventListener('click', () => {
+            window.vscode.postMessage({ type: 'refreshContent' });
+        });
+        el.addEventListener('contextmenu', e => {
+            e.preventDefault();
+            e.stopPropagation();
+        });
     }
 
     function setupNavigation() {
@@ -117,26 +413,93 @@
         }
     }
 
-    function handleContextMenu(e) {
-        e.preventDefault();
-        e.stopPropagation();
-        
-        // 先移除已有菜单
+    window.showCustomContextMenu = function(e, items, owner) {
+        if (e.preventDefault) {
+            e.preventDefault();
+        }
+        if (e.stopPropagation) {
+            e.stopPropagation();
+        }
         const oldMenu = document.getElementById('custom-context-menu');
-        if (oldMenu) oldMenu.remove();
-
-        // 创建菜单
+        if (oldMenu) {
+            oldMenu.remove();
+        }
         const menu = document.createElement('div');
         menu.id = 'custom-context-menu';
         menu.className = 'custom-context-menu';
-        menu.style.visibility = 'hidden'; // 先隐藏，后面再显示
+        menu.dataset.owner = owner || '';
+        menu.style.visibility = 'hidden';
+        menu.addEventListener('mousedown', ev => ev.stopPropagation());
+        menu.addEventListener('mouseup', ev => ev.stopPropagation());
+        menu.addEventListener('click', ev => ev.stopPropagation());
+        items.forEach(item => {
+            if (item.type === 'separator') {
+                const sep = document.createElement('div');
+                sep.className = 'custom-context-menu-separator';
+                menu.appendChild(sep);
+                return;
+            }
+            if (item.type === 'heading') {
+                const head = document.createElement('div');
+                head.className = 'custom-context-menu-heading';
+                head.textContent = item.label || '';
+                menu.appendChild(head);
+                return;
+            }
+            const el = document.createElement('div');
+            el.className = 'custom-context-menu-item';
+            if (item.checked) {
+                el.classList.add('is-checked');
+            }
+            if (item.disabled) {
+                el.classList.add('is-disabled');
+            }
+            if (item.title) {
+                el.title = item.title;
+            }
+            const label = document.createElement('span');
+            label.className = 'custom-context-menu-label';
+            label.textContent = item.label || '';
+            el.appendChild(label);
+            if (item.detail) {
+                const detail = document.createElement('span');
+                detail.className = 'custom-context-menu-detail';
+                detail.textContent = item.detail;
+                el.appendChild(detail);
+            }
+            el.onclick = () => {
+                if (!item.disabled && item.action) {
+                    item.action();
+                }
+                menu.remove();
+            };
+            menu.appendChild(el);
+        });
+        document.body.appendChild(menu);
+        const menuRect = menu.getBoundingClientRect();
+        let left = e.clientX;
+        let top = e.clientY;
+        const padding = 4;
+        if (left + menuRect.width > window.innerWidth - padding) {
+            left = window.innerWidth - menuRect.width - padding;
+        }
+        if (top + menuRect.height > window.innerHeight - padding) {
+            top = window.innerHeight - menuRect.height - padding;
+        }
+        menu.style.left = Math.max(left, padding) + 'px';
+        menu.style.top = Math.max(top, padding) + 'px';
+        menu.style.visibility = 'visible';
+        document.addEventListener('mousedown', function onDocClick() {
+            menu.remove();
+            document.removeEventListener('mousedown', onDocClick);
+        });
+        window.addEventListener('blur', function onBlur() {
+            menu.remove();
+            window.removeEventListener('blur', onBlur);
+        });
+    };
 
-        // 阻止事件穿透
-        menu.addEventListener('mousedown', e => e.stopPropagation());
-        menu.addEventListener('mouseup', e => e.stopPropagation());
-        menu.addEventListener('click', e => e.stopPropagation());
-
-        // 菜单项
+    function handleContextMenu(e) {
         const items = [
             { 
                 label: 'Pin',
@@ -178,76 +541,16 @@
                 action: () => window.vscode.postMessage({ type: 'float' })
             },
             {
+                label: 'Float (Independent Window)',
+                action: () => window.vscode.postMessage({ type: 'floatIndependent' })
+            },
+            { type: 'separator' },
+            {
                 label: 'Pick Token Style',
                 checked: window.pickTokenStyle,
                 action: () => window.postMessage({ type: 'PickTokenStyle' })
-            },
-            {
-                label: 'Hover Tips',
-                checked: window.enableHover,
-                action: () => window.postMessage({ type: 'EnableHover' })
-            },
-            {
-                label: 'Select Bracket/Quote Pair (dbl-click)',
-                checked: window.selectBracketPairEnabled,
-                action: () => window.vscode.postMessage({ type: 'toggleSelectBracketPair' })
-            },
-            { type: 'separator' }, // 分割条
-            {
-                label: 'Sticky Scroll',
-                checked: window.stickyScroll,
-                action: () => window.postMessage({ type: 'StickyScroll' })
             }
         ];
-
-        items.forEach(item => {
-            if (item.type === 'separator') {
-                const sep = document.createElement('div');
-                sep.className = 'custom-context-menu-separator';
-                menu.appendChild(sep);
-                return;
-            }
-            const el = document.createElement('div');
-            el.textContent = (item.checked ? '✔ ' : '') + item.label;
-            el.className = 'custom-context-menu-item';
-            el.onclick = () => {
-                item.action();
-                menu.remove();
-            };
-            menu.appendChild(el);
-        });
-
-        document.body.appendChild(menu);
-
-        // 计算菜单位置，防止溢出
-        const menuRect = menu.getBoundingClientRect();
-        let left = e.clientX;
-        let top = e.clientY;
-        const padding = 4; // 距离边缘的最小距离
-
-        if (left + menuRect.width > window.innerWidth - padding) {
-            left = window.innerWidth - menuRect.width - padding;
-        }
-        if (top + menuRect.height > window.innerHeight - padding) {
-            top = window.innerHeight - menuRect.height - padding;
-        }
-        left = Math.max(left, padding);
-        top = Math.max(top, padding);
-
-        menu.style.left = left + 'px';
-        menu.style.top = top + 'px';
-        menu.style.visibility = 'visible';
-
-        // 点击其它地方关闭菜单
-        document.addEventListener('mousedown', function onDocClick() {
-            menu.remove();
-            document.removeEventListener('mousedown', onDocClick);
-        });
-
-        // webview失去焦点时关闭菜单
-        window.addEventListener('blur', function onBlur() {
-            menu.remove();
-            window.removeEventListener('blur', onBlur);
-        });
+        window.showCustomContextMenu(e, items);
     }
 })();

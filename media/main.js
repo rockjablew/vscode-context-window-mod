@@ -1,6 +1,7 @@
 //@ts-check
 
 // 导入语言配置与各功能模块
+import { registerCommentAwareHighlight } from './documentHighlightProvider.js';
 import { createBraceFoldingRangeProvider } from './braceFoldingProvider.js';
 import { BRACE_LANGS } from './braceLangs.js';
 import { resetPickColorPosition } from './tokenPicker.js';
@@ -11,7 +12,10 @@ import { createUpdateEditorContent } from './editorContent.js';
 import { createMessageHandlers } from './messageHandlers.js';
 import { setupEditorMouseHandlers } from './editorMouseHandlers.js';
 import { setupTextmate, ensureGrammar as tmEnsureGrammar, updateThemeScopes as tmUpdateThemeScopes, setOnGrammarRegistered as tmSetOnGrammarRegistered } from './textmateClient.js';
+import { setupLanguageConfig, ensureLanguageConfig } from './languageConfigClient.js';
 import { setupHoverProvider, ensureHoverProvider, handleHoverResult, disableMonacoBuiltinTsJsProviders, disposeHoverProvider } from './hoverProvider.js';
+import { createJumpTrail } from './jumpTrail.js';
+import { createLineBlame } from './lineBlame.js';
 
 const fileContentCache = new Map();  // uri -> { version, content, metadata }
 
@@ -24,20 +28,27 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
     window.vscode = vscode;
     window.isPinned = false;
     window.pickTokenStyle = false;
-    window.stickyScroll = false;
     // Hover Tips 初值：从后端下发的 contextEditorCfg.enableHover 读取，不存在时默认 false。
-    // 右键菜单 "Hover Tips" 切换后反转该值，同时以 'setEnableHover' 消息告知后端持久化。
+    // 底栏 tips 图标切换后反转该值，同时以 'setEnableHover' 消息告知后端持久化。
     {
         const cfg0 = window.vsCodeEditorConfiguration && window.vsCodeEditorConfiguration.contextEditorCfg;
         window.enableHover = (cfg0 && typeof cfg0.enableHover === 'boolean') ? cfg0.enableHover : false;
+        // 与 jumpTrail / lineBlame 一样先用下发的有效值，避免底栏图标在 Monaco 起来前按 false 画一帧。
+        window.stickyScroll = (cfg0 && typeof cfg0.stickyScroll === 'boolean') ? cfg0.stickyScroll : true;
+        window.jumpTrailEnabled = (cfg0 && typeof cfg0.jumpTrail === 'boolean') ? cfg0.jumpTrail : true;
+        window.jumpTrailMaxItems = (cfg0 && typeof cfg0.jumpTrailMaxItems === 'number')
+            ? Math.max(2, Math.floor(cfg0.jumpTrailMaxItems))
+            : 8;
+        window.lineBlameEnabled = (cfg0 && typeof cfg0.lineBlame === 'boolean') ? cfg0.lineBlame : true;
+        window.lineBlameHoverAuto = (cfg0 && typeof cfg0.lineBlameHover === 'boolean') ? cfg0.lineBlameHover : false;
     }
 
     // 统一调试日志开关：默认关闭，排查问题时置为 true 即可恢复所有调试输出，
     // 避免历史遗留的 [definition] 前缀散落各处且无法集中控制。
-    const DEBUG = false;
     function log(...args) {
-        if (DEBUG) {
-            console.log('[context-window]', ...args);
+        const cfg = window.vsCodeEditorConfiguration && window.vsCodeEditorConfiguration.contextEditorCfg;
+        if (cfg && cfg.logging) {
+            console.log('[context-view] [context]', ...args);
         }
     }
 
@@ -242,10 +253,18 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                             // 关掉它可让左键双击退回传统「选词」，与升级前版本行为保持一致，也不与右键手势冲突。
                             // 放在 ...otherOptions 之后，避免被 VSCode 用户配置里的同名项覆盖（与下方 occurrencesHighlight 兜底同思路）。
                             doubleClickSelectsBlock: false,
+                            // 「光标处同词高亮」默认关（contextView.contextWindow.occurrencesHighlight）：
+                            // 本面板的光标是程序设置的（跳转/返回定位），而它画的框（无 provider 时走文本回退，
+                            // 用的是 selectionHighlight 配色）只认「光标所在的词」，光标差一列框就跑到旁边的
+                            // 无关标识符上（如 this）。返回落点的 token 由 updateEditorContent 用
+                            // cw-return-token 显式高亮，不受本开关影响。
+                            // 注意：selectionHighlight 不动——它由真实选区驱动（右键选词），是要保留的行为。
+                            occurrencesHighlight: contextEditorCfg.occurrencesHighlight ? 'singleFile' : 'off',
                             // 同步 VSCode 的括号对着色开关（覆盖 Monaco 默认的 enabled:true）。
                             bracketPairColorization: {
                                 ...(bracketPairColorization || {}),
-                                enabled: contextEditorCfg.bracketPairColorization !== false
+                                enabled: contextEditorCfg.bracketPairColorization !== false,
+                                independentColorPoolPerBracketType: contextEditorCfg.independentColorPoolPerBracketType === true
                             },
                             // 自定义 Hover Provider 走扩展端 LSP（vscode.executeHoverProvider），
                             // 不依赖 Monaco 内置 Worker，规避了「webview 中 Worker 长期 pending → 浮窗一直 loading」。
@@ -254,6 +273,11 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                                 enabled: true,
                                 delay: 300,
                                 sticky: true
+                            },
+                            find: {
+                                addExtraSpaceOnTop: true,
+                                autoFindInSelection: 'never',
+                                seedSearchStringFromSelection: 'select'
                             },
                             // 启用快速建议
                             quickSuggestions: true,
@@ -275,13 +299,16 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                             model.updateOptions({ insertSpaces: defaultInsertSpaces, tabSize: defaultTabSize });
                         }
 
+                        // createModel 默认强制开启 Monaco 括号对着色，需按 VSCode 设置显式覆盖。
                         const cfg = window.vsCodeEditorConfiguration?.contextEditorCfg || {};
-                        model.updateOptions({
-                            bracketColorizationOptions: {
-                                enabled: cfg.bracketPairColorization !== false,
-                                independentColorPoolPerBracketType: false
-                            }
-                        });
+                        const pairOpts = {
+                            enabled: cfg.bracketPairColorization !== false,
+                            independentColorPoolPerBracketType: cfg.independentColorPoolPerBracketType === true
+                        };
+                        model.updateOptions({ bracketColorizationOptions: pairOpts });
+                        try {
+                            editor.updateOptions({ bracketPairColorization: pairOpts });
+                        } catch (_) { /* editor 尚未创建 */ }
                     }
 
                     // 创建编辑器实例
@@ -291,7 +318,18 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                     });
 
                     const currentStickyScroll = editor.getOption(monaco.editor.EditorOption.stickyScroll);
-                    window.stickyScroll = currentStickyScroll?.enabled;
+                    // Sticky Scroll 启用状态以后端下发的「有效值」为准（contextEditorCfg.stickyScroll）：
+                    // 插件自身配置未设置时该值 = 主编辑器 editor.stickyScroll.enabled（跟随 VSCode），
+                    // 显式设置后= 插件自身值（右键菜单切换会写入并覆盖）。据此显式设置 Monaco，
+                    // 避免仅依赖 editorOptions 透传导致的「右键取消只是临时、重启又回到 VSCode 全局值」。
+                    {
+                        const cfgSticky = contextEditorCfg.stickyScroll;
+                        window.stickyScroll = (typeof cfgSticky === 'boolean') ? cfgSticky : !!currentStickyScroll?.enabled;
+                        editor.updateOptions({ stickyScroll: { enabled: window.stickyScroll } });
+                        if (typeof window.updateViewToggles === 'function') {
+                            window.updateViewToggles();
+                        }
+                    }
                     // sticky scroll 的 defaultModel 由 editorContent.js 的 refreshStickyScroll 按当前文件语言动态切换：
                     // TS/JS 用 foldingProviderModel（其 outline 在 webview 中不可用，缩进模型又处理不了「{ 独占一行」），
                     // 其它语言用 outlineModel（显示函数名）。
@@ -305,12 +343,18 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                         uri: '',
                         content: '',
                         language: '',
-                        // 定位信息（range/curLine）归前端管：在 updateMetadata 阶段保存，
+                        // 定位信息（range/curLine/curColumn）归前端管：在 updateMetadata 阶段保存，
                         // 回源拿到内容（updateContent）时复用，避免后端现取时丢失光标定位。
                         range: null,
                         curLine: -1,
+                        curColumn: -1,
+                        // 当前渲染内容的文档版本：内容到达(updateContent/命中缓存)时记录，
+                        // 供异步后到的 updateSemantic 做过期校验（-1 表示尚未记录，不校验版本）。
+                        contentVersion: -1,
                         activeLineDecorations: [],
                         symboleDecorations: [],
+                        // 返回落点 token 的高亮装饰 id（当初点出去的那个词，如 HasInput）
+                        returnTokenDecorations: [],
                         // #include/#pragma/#region/#endregion 等指令高亮的装饰 id
                         directiveDecorations: []
                     };
@@ -347,10 +391,13 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                         // 关闭 Monaco 0.56.0 的 doubleClickSelectsBlock（默认 true）：与 createEditorOptions 处一致，
                         // 让左键双击退回传统选词、保持与升级前行为一致，此处再兜底一次防被覆盖。
                         doubleClickSelectsBlock: false,
+                        // 同 createEditorOptions：createEditorOptions 里的值可能被 VSCode 配置里的
+                        // editor.occurrencesHighlight 经 ...otherOptions 覆盖，这里按本插件的开关兜底一次
+                        occurrencesHighlight: contextEditorCfg.occurrencesHighlight ? 'singleFile' : 'off',
                         // 与 createEditorOptions 保持一致：自定义 hover 走扩展端 LSP，启用浮窗
                         hover: { enabled: true, delay: 300, sticky: true },
-                        find: {                     // 禁用查找功能
-                            addExtraSpaceOnTop: false,
+                        find: {
+                            addExtraSpaceOnTop: true,
                             autoFindInSelection: 'never',
                             seedSearchStringFromSelection: 'select'
                         }
@@ -440,13 +487,34 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                         }
                     }
 
+                    // 只有「能移动光标」的按键才显示光标：方向键、Home/End、PageUp/PageDown。
+                    // Ctrl/Alt/Shift 等修饰键、以及普通字符键（本编辑器只读，不产生输入）一律不触发，
+                    // 避免按 Ctrl+F / Alt+W 等快捷键时光标无谓地闪现。
+                    const CURSOR_MOVE_KEYCODES = new Set([
+                        monaco.KeyCode.LeftArrow,
+                        monaco.KeyCode.RightArrow,
+                        monaco.KeyCode.UpArrow,
+                        monaco.KeyCode.DownArrow,
+                        monaco.KeyCode.Home,
+                        monaco.KeyCode.End,
+                        monaco.KeyCode.PageUp,
+                        monaco.KeyCode.PageDown
+                    ]);
+                    const isCursorMoveKey = (e) =>
+                        e && CURSOR_MOVE_KEYCODES.has(e.keyCode) &&
+                        !e.ctrlKey && !e.altKey && !e.metaKey;
+
                     // 监听键盘输入事件
                     editor.onKeyDown((e) => {
-                        showCursor();
+                        if (isCursorMoveKey(e)) {
+                            showCursor();
+                        }
                     });
 
                     editor.onKeyUp((e) => {
-                        showCursor();
+                        if (isCursorMoveKey(e)) {
+                            showCursor();
+                        }
                     });
 
                     // 监听鼠标点击事件
@@ -492,18 +560,49 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                     // 语义着色会话状态：后端透传的整文档语义 token（legend + data）。
                     // 前端不再用手写 Monarch 去"猜"标识符语义，改由 VSCode 语言服务器的语义 token 驱动着色。
                     const semanticState = { legend: null, data: null };
-                    // 语义 token 变更通知：内容相同但语义数据更新（如缓存命中/live 重取）时，
-                    // 主动触发 Monaco 重新向 provider 索取语义 token 并重着色。
+                    // 语义 token 变更通知：data 异步到达后触发 Monaco 重新向 provider 索取 data 并重着色。
                     const semanticTokensEmitter = new monaco.Emitter();
 
-                    // 写入后端发来的语义 token 并通知 Monaco 刷新（在 setValue 前调用，保证 provide 时数据已就绪）
+                    // 对齐 VSCode 架构：Monaco 的 SemanticTokensProviderStyling 以 provider 对象为 key
+                    // 缓存一次 getLegend() 的结果，之后永不重取 legend；onDidChange.fire() 只让它重取 data。
+                    // 因此关键在于——首帧建 styling 时 getLegend() 必须已返回「完整 legend」。
+                    //我们照VSCode 做法把 legend 与 data 解耦：后端在「内容下发阶段」随内容带上 legend
+                    //（provideDocumentSemanticTokensLegend 很快），前端在setValue 前先写入 semanticState.legend，
+                    // 使首帧 getStyling 就用完整 legend 建映射；data 慢、异步后到时仅需 fire() 让 Monaco
+                    // 用「已正确的 styling」重取 data → 上色。不再需要空legend→有内容时重注册 provider 的手段。
+
+                    // 内容阶段：随内容一起下发的 legend 先行写入（此时 data 尚未到达，置空）。
+                    // 必须在 setValue 之前调用，保证 Monaco 首帧建 styling 时 getLegend() 已是完整 legend。
+                    function setSemanticLegend(legend) {
+                        if (legend && Array.isArray(legend.tokenTypes) && legend.tokenTypes.length) {
+                            semanticState.legend = legend;
+                        } else {
+                            semanticState.legend = null;
+                        }
+                        // 新内容渲染前清空上一份 data，避免旧 data 串到新内容
+                        semanticState.data = null;
+                    }
+
+                    // data 异步到达：写入 data（并以其权威 legend 为准）后通知 Monaco 重取。
+                    // legend 已在内容阶段就位、styling 正确，故这里只需 fire。
+                    // Monaco 只在首次用到 provider 时读一次 legend。那一刻语言服务可能还没就绪、legend 为空，
+                    // 之后 data 带着完整 legend 到来也不会被采用；此时要换一个新 provider 让它重读。
+                    let seenLegendKey = null;
+                    let rebindSemanticProvider = null;
+                    const legendKey = (legend) => legend
+                        ? JSON.stringify([legend.tokenTypes || [], legend.tokenModifiers || []])
+                        : '';
+
                     function applySemanticTokens(semantic) {
                         if (semantic && Array.isArray(semantic.data) && semantic.legend && Array.isArray(semantic.legend.tokenTypes)) {
                             semanticState.legend = semantic.legend;
                             semanticState.data = semantic.data;
+                            if (rebindSemanticProvider && seenLegendKey !== null && seenLegendKey !== legendKey(semantic.legend)) {
+                                rebindSemanticProvider();
+                                return;
+                            }
                         } else {
-                            // 无语义 token（未装语言扩展 / 不支持 / 文档未纳入分析）：清空，回退到基础着色
-                            semanticState.legend = null;
+                            // 无语义 data（未装语言扩展 / 不支持 / 文档未纳入分析）：清空 data，回退到基础着色
                             semanticState.data = null;
                         }
                         try { semanticTokensEmitter.fire(); } catch (_) {}
@@ -519,24 +618,36 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                             'javascript', 'typescript', 'cpp', 'c', 'csharp', 'go'
                         ];
 
-                        const semanticProvider = {
-                            onDidChange: semanticTokensEmitter.event,
-                            getLegend() {
-                                return semanticState.legend || { tokenTypes: [], tokenModifiers: [] };
-                            },
-                            provideDocumentSemanticTokens() {
-                                if (!semanticState.data || !semanticState.legend) {
-                                    return null;
-                                }
-                                return { data: new Uint32Array(semanticState.data), resultId: undefined };
-                            },
-                            releaseDocumentSemanticTokens() {}
+                        let semanticRegistrations = [];
+                        rebindSemanticProvider = () => {
+                            semanticRegistrations.forEach(d => d.dispose());
+                            seenLegendKey = null;
+                            const semanticProvider = {
+                                onDidChange: semanticTokensEmitter.event,
+                                getLegend() {
+                                    const legend = semanticState.legend || { tokenTypes: [], tokenModifiers: [] };
+                                    seenLegendKey = legendKey(semanticState.legend);
+                                    return legend;
+                                },
+                                provideDocumentSemanticTokens() {
+                                    if (!semanticState.data || !semanticState.legend) {
+                                        return null;
+                                    }
+                                    return { data: new Uint32Array(semanticState.data), resultId: undefined };
+                                },
+                                releaseDocumentSemanticTokens() {}
+                            };
+                            semanticRegistrations = semanticLanguages.map(lang =>
+                                monaco.languages.registerDocumentSemanticTokensProvider(lang, semanticProvider));
                         };
-
-                        semanticLanguages.forEach(lang => {
-                            monaco.languages.registerDocumentSemanticTokensProvider(lang, semanticProvider);
-                        });
+                        rebindSemanticProvider();
                     }
+
+                    // 注册注释/字符串感知的同词高亮 provider（occurrencesHighlight）。
+                    // 缺省无 provider 时 Monaco 退化为不区分注释的文本兜底，导致注释里的词也被高亮；
+                    // 本 provider score 更高会被优先采用，在注释/字符串里返回空、其余位置全词匹配，
+                    // 与 VSCode 主编辑器行为对齐。内部有一次性护栏，重复调用不会叠加。
+                    registerCommentAwareHighlight(monaco, editor);
 
                     // 所有基于花括号的语言（BRACE_LANGS）统一用 braceFoldingProvider 驱动
                     // sticky scroll（foldingProviderModel）。花括号配对 + 声明行上提是语言无关的，
@@ -578,55 +689,148 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                     //     }
                     // });
 
-                    const editorDomNode = editor.getDomNode();
-                    if (editorDomNode) {
-                        editorDomNode.addEventListener('dblclick', (e) => {
-                            if (e.target && (
-                                e.target.tagName === 'TEXTAREA' && e.target.className === 'input' ||
-                                e.target.getAttribute('aria-label') === 'Find' ||
-                                e.target.getAttribute('placeholder') === 'Find' ||
-                                e.target.getAttribute('title') === 'Find'
-                            )) {
-                                return true;
+                    window.contextWindowEditor = editor;
+
+                    function copyFromEditor(clientX, clientY) {
+                        const model = editor.getModel();
+                        if (!model) {
+                            return '';
+                        }
+                        const sel = editor.getSelection();
+                        if (sel && !sel.isEmpty()) {
+                            return model.getValueInRange(sel);
+                        }
+                        const target = editor.getTargetAtClientPoint(clientX, clientY);
+                        const pos = target && target.position;
+                        if (!pos) {
+                            return '';
+                        }
+                        const word = model.getWordAtPosition(pos);
+                        return (word && word.word) || '';
+                    }
+
+                    function positionFromEvent(clientX, clientY) {
+                        const target = editor.getTargetAtClientPoint(clientX, clientY);
+                        const pos = target && target.position;
+                        if (!pos) {
+                            return undefined;
+                        }
+                        return { line: pos.lineNumber - 1, character: pos.column - 1 };
+                    }
+
+                    let ctxImplSeq = 0;
+                    /** @type {{ reqId: number, at: { clientX: number, clientY: number }, base: any[] } | null} */
+                    let ctxImplPending = null;
+
+                    function showEditorModMenu(e) {
+                        if (typeof window.showCustomContextMenu !== 'function') {
+                            return;
+                        }
+                        const text = copyFromEditor(e.clientX, e.clientY);
+                        const loc = positionFromEvent(e.clientX, e.clientY);
+                        const base = [
+                            {
+                                label: 'Copy',
+                                disabled: !text,
+                                action: () => {
+                                    if (text) {
+                                        vscode.postMessage({ type: 'copyToClipboard', text });
+                                    }
+                                }
+                            },
+                            { type: 'separator' },
+                            {
+                                label: 'Show Relation',
+                                action: () => vscode.postMessage({ type: 'showCallRelation', independent: false, ...loc })
+                            },
+                            {
+                                label: 'Show Relation (Independent Window)',
+                                action: () => vscode.postMessage({ type: 'showCallRelation', independent: true, ...loc })
+                            },
+                            {
+                                label: 'Find Relation',
+                                action: () => vscode.postMessage({ type: 'findCallRelation', ...loc })
+                            },
+                            {
+                                label: 'Find Relation (in ContextView)',
+                                action: () => vscode.postMessage({ type: 'findCallRelationInContext', ...loc })
                             }
-                            //e.preventDefault();
-                            //e.stopPropagation();
-                            //console.log('[definition] DOM 级别拦截到双击事件', e.target);
-                            
-                            if (e.target.type !== monaco.editor.MouseTargetType.CONTENT_TEXT) {
-                                vscode.postMessage({
-                                    type: 'doubleClick',
-                                    location: 'bottomArea'
+                        ];
+                        const reqId = ++ctxImplSeq;
+                        const at = { clientX: e.clientX, clientY: e.clientY };
+                        ctxImplPending = { reqId, at, base };
+                        window.showCustomContextMenu(e, [
+                            ...base,
+                            { type: 'separator' },
+                            { label: 'Loading implementations…', disabled: true }
+                        ], `impl:${reqId}`);
+                        vscode.postMessage({ type: 'listContextImplementations', reqId, ...loc });
+                    }
+
+                    function onContextImplementations(msg) {
+                        const pending = ctxImplPending;
+                        if (!pending || msg.reqId !== pending.reqId || typeof window.showCustomContextMenu !== 'function') {
+                            return;
+                        }
+                        const owner = `impl:${pending.reqId}`;
+                        const menu = document.getElementById('custom-context-menu');
+                        if (!menu || menu.dataset.owner !== owner) {
+                            ctxImplPending = null;
+                            return;
+                        }
+                        const partial = !!msg.pending;
+                        if (!partial) {
+                            ctxImplPending = null;
+                        }
+                        const list = Array.isArray(msg.items) ? msg.items : [];
+                        const more = Number(msg.more) || 0;
+                        const showSection = list.length >= 2 || partial || !!msg.timedOut;
+                        const items = pending.base.slice();
+                        if (showSection) {
+                            items.push({ type: 'separator' }, { type: 'heading', label: 'Implementations' });
+                            for (const impl of list) {
+                                items.push({
+                                    label: impl.typeName ? `${impl.typeName}.${impl.name}` : impl.name,
+                                    detail: `${impl.file}:${impl.line}`,
+                                    checked: !!impl.current,
+                                    title: impl.current ? 'Currently shown' : '',
+                                    action: impl.current
+                                        ? undefined
+                                        : () => vscode.postMessage({
+                                            type: 'pickContextImplementation',
+                                            name: impl.name || '',
+                                            target: { uri: impl.uri, line: impl.line0, character: impl.character }
+                                        })
                                 });
                             }
+                            if (more > 0) {
+                                items.push({ label: `+${more} more`, disabled: true, title: 'Only the first entries are listed' });
+                            }
+                            if (partial) {
+                                items.push({ label: 'Searching overrides…', disabled: true });
+                            } else if (msg.timedOut) {
+                                items.push({
+                                    label: 'Override search timed out',
+                                    disabled: true,
+                                    title: 'The language server is still searching; reopen this menu later to see the result'
+                                });
+                            }
+                        }
+                        window.showCustomContextMenu(pending.at, items, partial ? owner : undefined);
+                    }
 
-                            return true;
-                        }, true); // 使用捕获阶段，确保在事件到达 Monaco 之前拦截
-
+                    const editorDomNode = editor.getDomNode();
+                    if (editorDomNode) {
                         editorDomNode.addEventListener('contextmenu', (e) => {
                             if (e.ctrlKey || e.shiftKey || e.metaKey) {
-                                // shift+右键，手动弹出 Monaco 菜单
-                                // 需要调用 Monaco 的菜单 API
-                                // 下面是常见做法（不同版本API略有不同）
-                                if (editor._contextMenuService) {
-                                    // 6.x/7.x 版本
-                                    editor._contextMenuService.showContextMenu({
-                                        getAnchor: () => ({ x: e.clientX, y: e.clientY }),
-                                        getActions: () => editor._getMenuActions(),
-                                        onHide: () => {},
-                                    });
-                                } else if (editor.trigger) {
-                                    // 旧版
-                                    editor.trigger('keyboard', 'editor.action.showContextMenu', {});
-                                }
-                            } else {
-                                // 普通右键，执行你自己的逻辑
-                                editor.focus();
                                 e.preventDefault();
                                 e.stopPropagation();
-                                // 这里写你自己的右键菜单逻辑
-                                //console.log('自定义右键菜单');
+                                showEditorModMenu(e);
+                                return;
                             }
+                            editor.focus();
+                            e.preventDefault();
+                            e.stopPropagation();
                         }, true);
                     }
 
@@ -640,22 +844,27 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                     // 之前用 closest('.monaco-editor') 判定是否屏蔽，但 Monaco 为语义 token 标识符
                     // (如 vscode.Disposable) 创建的隐藏输入框 / overflow widget 会挂到该子树之外，导致这次
                     // contextmenu 漏网、原生菜单盖在 token 浮窗上——这正是「浮窗弹出后又马上变菜单」的根因。
-                    // 改为「默认屏蔽 + 仅放行状态栏」即可彻底解决；shift/ctrl/meta+右键 放行给 Monaco 菜单逻辑。
+                    // 改为「默认屏蔽 + 仅放行状态栏」。Ctrl/Shift/Meta+右键也不再放行系统菜单，
+                    // 由编辑器节点上的自定义菜单处理。
                     if (!window.__ctxMenuSuppressorInstalled) {
                         window.__ctxMenuSuppressorInstalled = true;
                         document.addEventListener('contextmenu', (e) => {
-                            if (e.ctrlKey || e.shiftKey || e.metaKey) {
-                                return;
-                            }
                             const t = e.target;
-                            // 底部状态栏保留自身的自定义右键菜单，放行让 navigation.js 处理
                             if (t && typeof t.closest === 'function' &&
-                                (t.closest('.nav-bar') || t.closest('.double-click-area'))) {
+                                (t.closest('.nav-bar') || t.closest('.double-click-area') || t.closest('#jump-trail') || t.closest('#jump-mode-menu') || t.closest('#custom-context-menu'))) {
                                 return;
                             }
-                            // 其它区域：统一禁用浏览器原生右键菜单
                             e.preventDefault();
-                            e.stopPropagation();
+                            const mod = e.ctrlKey || e.shiftKey || e.metaKey;
+                            const inMain = !!(editorDomNode && t && editorDomNode.contains(t));
+                            if (mod && !inMain && t && typeof t.closest === 'function' && t.closest('.monaco-editor')) {
+                                e.stopPropagation();
+                                showEditorModMenu(e);
+                                return;
+                            }
+                            if (!mod) {
+                                e.stopPropagation();
+                            }
                         }, true);
                     }
 
@@ -702,7 +911,7 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
 
                     // 鼠标交互逻辑（悬停高亮 + 点击跳转/取色）已抽离到 editorMouseHandlers.js
                     // （内部持有悬停高亮状态并完成 onMouseMove / onMouseUp / mouseleave 注册）
-                    setupEditorMouseHandlers({
+                    const mouseHandlers = setupEditorMouseHandlers({
                         editor,
                         state: editorState,
                         light,
@@ -736,6 +945,9 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                     // 关闭 Monaco 内置 ts/js 模块自动注册的 hover/signatureHelp/completion 等依赖 worker 的 provider，
                     // 避免浮窗顶部已有我们的内容、下方又追加 "Loading..." （来自 Monaco 自带 ts hover provider）。
                     disableMonacoBuiltinTsJsProviders();
+
+                    // VSCode 语言配置（含 TS/JS 的 `${` `}` 括号对）。与 TextMate 无关，默认分词模式也要接。
+                    setupLanguageConfig({ monaco, vscode });
 
                     // 通知扩展编辑器已准备好
                     vscode.postMessage({ type: 'editorReady' });
@@ -779,19 +991,40 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                         updateFilenameDisplay,
                         hideCursor,
                         // 方案 B：真实 TextMate 语法按需加载入口（未启用时为 no-op）
-                        ensureGrammar: tmEnsureGrammar
+                        ensureGrammar: tmEnsureGrammar,
+                        ensureLanguageConfig
+                    });
+
+                    const lineBlame = createLineBlame({
+                        editor,
+                        state: editorState,
+                        vscode,
+                        enabled: window.lineBlameEnabled,
+                        hoverAuto: window.lineBlameHoverAuto
+                    });
+
+                    const jumpTrail = createJumpTrail({
+                        editor,
+                        enabled: window.jumpTrailEnabled,
+                        maxItems: window.jumpTrailMaxItems,
+                        onLayout: () => {
+                            if (typeof updateEditorContent.revealCurrent === 'function') {
+                                updateEditorContent.revealCurrent();
+                            }
+                        }
                     });
 
                     // 消息处理逻辑已抽离到 messageHandlers.js（工厂持有 editor / editorState /
                     // 前端缓存 / vscode 通信 及内容更新、定义列表清理等回调）
-                    const { handleUpdateMetadata, handleUpdateContent, handleNoContent } = createMessageHandlers({
+                    const { handleUpdateMetadata, handleUpdateContent, handleNoContent, handleUpdateSemantic, handleInvalidateFileCache } = createMessageHandlers({
                         editor,
                         state: editorState,
                         fileContentCache,
                         vscode,
                         updateEditorContent,
                         clearDefinitionList,
-                        applySemanticTokens
+                        applySemanticTokens,
+                        setSemanticLegend
                     });
 
                     window.addEventListener('blur', () => {
@@ -807,19 +1040,44 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                         //console.log('[definition] Received message:', message);
                         try {
                             switch (message.type) {
+                                case 'contextImplementations':
+                                    onContextImplementations(message);
+                                    break;
+                                case 'JumpTrail':
+                                    window.jumpTrailEnabled = !window.jumpTrailEnabled;
+                                    jumpTrail.setEnabled(window.jumpTrailEnabled);
+                                    vscode.postMessage({ type: 'setJumpTrail', value: window.jumpTrailEnabled });
+                                    if (typeof window.updateViewToggles === 'function') {
+                                        window.updateViewToggles();
+                                    }
+                                    break;
+                                case 'LineBlame':
+                                    window.lineBlameEnabled = !window.lineBlameEnabled;
+                                    lineBlame.setEnabled(window.lineBlameEnabled);
+                                    vscode.postMessage({ type: 'setLineBlame', value: window.lineBlameEnabled });
+                                    if (typeof window.updateViewToggles === 'function') {
+                                        window.updateViewToggles();
+                                    }
+                                    break;
                                 case 'StickyScroll':
                                     window.stickyScroll = !window.stickyScroll;
                                     
                                     editor.updateOptions({
                                         stickyScroll: { enabled: window.stickyScroll }
                                     });
+                                    // 持久化到插件自身配置（覆盖「跟随 VSCode」的默认行为）：
+                                    // 否则右键取消只是运行时临时生效，重启后又回到 VSCode 全局 sticky scroll 值。
+                                    vscode.postMessage({ type: 'setStickyScroll', value: window.stickyScroll });
+                                    if (typeof window.updateViewToggles === 'function') {
+                                        window.updateViewToggles();
+                                    }
                                     break;
                                 case 'PickTokenStyle':
                                     window.pickTokenStyle = !window.pickTokenStyle;
                                     resetPickColorPosition();
                                     break;
                                 case 'EnableHover':
-                                    // 右键菜单切换：反转状态、按需 register/dispose provider、并告知后端持久化。
+                                    // 底栏 tips 图标切换：反转状态、按需 register/dispose provider、并告知后端持久化。
                                     window.enableHover = !window.enableHover;
                                     if (window.enableHover) {
                                         ensureHoverProvider();
@@ -827,6 +1085,9 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                                         disposeHoverProvider();
                                     }
                                     vscode.postMessage({ type: 'setEnableHover', value: window.enableHover });
+                                    if (typeof window.updateViewToggles === 'function') {
+                                        window.updateViewToggles();
+                                    }
                                     break;
                                 case 'pinState':
                                     window.isPinned = message.pinned;
@@ -838,13 +1099,68 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                                         }
                                     }
                                     break;
+                                case 'updateSelectBracketPair': {
+                                    const cfg = window.vsCodeEditorConfiguration.contextEditorCfg
+                                        || (window.vsCodeEditorConfiguration.contextEditorCfg = {});
+                                    cfg.doubleClickSelectsBracketPair = !!message.value;
+                                    if (typeof window.updateSiIndicator === 'function') {
+                                        window.updateSiIndicator();
+                                    }
+                                    break;
+                                }
+                                case 'updateViewFlags': {
+                                    const cfg = window.vsCodeEditorConfiguration.contextEditorCfg
+                                        || (window.vsCodeEditorConfiguration.contextEditorCfg = {});
+                                    if (typeof message.doubleClickSelectsBracketPair === 'boolean') {
+                                        cfg.doubleClickSelectsBracketPair = message.doubleClickSelectsBracketPair;
+                                        if (typeof window.updateSiIndicator === 'function') {
+                                            window.updateSiIndicator();
+                                        }
+                                    }
+                                    if (typeof message.jumpTrail === 'boolean'
+                                        && window.jumpTrailEnabled !== message.jumpTrail) {
+                                        window.jumpTrailEnabled = message.jumpTrail;
+                                        jumpTrail.setEnabled(window.jumpTrailEnabled);
+                                    }
+                                    if (typeof message.lineBlame === 'boolean'
+                                        && window.lineBlameEnabled !== message.lineBlame) {
+                                        window.lineBlameEnabled = message.lineBlame;
+                                        lineBlame.setEnabled(window.lineBlameEnabled);
+                                    }
+                                    if (typeof message.stickyScroll === 'boolean'
+                                        && window.stickyScroll !== message.stickyScroll) {
+                                        window.stickyScroll = message.stickyScroll;
+                                        if (editor) {
+                                            editor.updateOptions({ stickyScroll: { enabled: window.stickyScroll } });
+                                        }
+                                    }
+                                    if (typeof message.enableHover === 'boolean'
+                                        && window.enableHover !== message.enableHover) {
+                                        window.enableHover = message.enableHover;
+                                        if (window.enableHover) {
+                                            ensureHoverProvider();
+                                        } else {
+                                            disposeHoverProvider();
+                                        }
+                                    }
+                                    if (typeof message.jumpMode === 'string') {
+                                        cfg.jumpMode = message.jumpMode;
+                                        if (typeof window.updateJumpMode === 'function') {
+                                            window.updateJumpMode();
+                                        }
+                                    }
+                                    if (typeof window.updateViewToggles === 'function') {
+                                        window.updateViewToggles();
+                                    }
+                                    break;
+                                }
                                 case 'updateContextEditorCfg':
                                     if (message.contextEditorCfg) {
                                         window.vsCodeEditorConfiguration.contextEditorCfg = message.contextEditorCfg;
                                         window.vsCodeEditorConfiguration.customThemeRules = message.customThemeRules;
 
                                         // Hover Tips 开关同步：用户在「设置」UI 改了 enableHover、或多窗口同步时，
-                                        // 这里需要按最新值调整 provider 的注册状态，并刷新 window.enableHover 以驱动右键菜单的勾选。
+                                        // 这里需要按最新值调整 provider 的注册状态，并刷新 window.enableHover 以驱动底栏图标。
                                         if (typeof message.contextEditorCfg.enableHover === 'boolean'
                                             && window.enableHover !== message.contextEditorCfg.enableHover) {
                                             window.enableHover = message.contextEditorCfg.enableHover;
@@ -855,10 +1171,55 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                                             }
                                         }
 
+                                        // Sticky Scroll 开关同步：设置 UI 改了 contextView.contextWindow.stickyScroll、
+                                        // 多窗口同步、或（未显式设置时）主编辑器 editor.stickyScroll.enabled 变化，
+                                        // 后端都会把最新「有效值」放进 contextEditorCfg.stickyScroll 回推。这里据此更新 Monaco
+                                        // 与 window.stickyScroll（驱动右键菜单勾选）。
+                                        if (typeof message.contextEditorCfg.stickyScroll === 'boolean'
+                                            && window.stickyScroll !== message.contextEditorCfg.stickyScroll) {
+                                            window.stickyScroll = message.contextEditorCfg.stickyScroll;
+                                            if (editor) {
+                                                editor.updateOptions({ stickyScroll: { enabled: window.stickyScroll } });
+                                            }
+                                        }
+
+                                        if (typeof message.contextEditorCfg.jumpTrail === 'boolean'
+                                            && window.jumpTrailEnabled !== message.contextEditorCfg.jumpTrail) {
+                                            window.jumpTrailEnabled = message.contextEditorCfg.jumpTrail;
+                                            jumpTrail.setEnabled(window.jumpTrailEnabled);
+                                        }
+
+                                        if (typeof message.contextEditorCfg.jumpTrailMaxItems === 'number'
+                                            && window.jumpTrailMaxItems !== message.contextEditorCfg.jumpTrailMaxItems) {
+                                            window.jumpTrailMaxItems = Math.max(2, Math.floor(message.contextEditorCfg.jumpTrailMaxItems));
+                                            jumpTrail.setMaxItems(window.jumpTrailMaxItems);
+                                        }
+
+                                        if (typeof message.contextEditorCfg.lineBlame === 'boolean'
+                                            && window.lineBlameEnabled !== message.contextEditorCfg.lineBlame) {
+                                            window.lineBlameEnabled = message.contextEditorCfg.lineBlame;
+                                            lineBlame.setEnabled(window.lineBlameEnabled);
+                                        }
+
+                                        if (typeof message.contextEditorCfg.lineBlameHover === 'boolean'
+                                            && window.lineBlameHoverAuto !== message.contextEditorCfg.lineBlameHover) {
+                                            window.lineBlameHoverAuto = message.contextEditorCfg.lineBlameHover;
+                                            lineBlame.setHoverAuto(window.lineBlameHoverAuto);
+                                        }
+
                                         // 「双击选中整对括号/引号」开关同步：无论来自快捷键、编辑器右键菜单、设置 UI 还是本栏 {si} 点击，
                                         // 配置变更都会广播到这里，刷新底部导航栏 {si} 指示器的开/关外观。
                                         if (typeof window.updateSiIndicator === 'function') {
                                             window.updateSiIndicator();
+                                        }
+                                        if (typeof window.updateViewToggles === 'function') {
+                                            window.updateViewToggles();
+                                        }
+                                        if (typeof window.updateJumpMode === 'function') {
+                                            window.updateJumpMode();
+                                        }
+                                        if (typeof window.updateUpdateMode === 'function') {
+                                            window.updateUpdateMode();
                                         }
 
                                         // 方案 B：用户自定义规则变化后，刷新可着色 scope 集合，
@@ -874,9 +1235,12 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                                                 {
                                                     minimap: { enabled: message.contextEditorCfg.minimap },
                                                     fontSize: message.contextEditorCfg.fontSize,
-                                                    fontFamily: message.contextEditorCfg.fontFamily
+                                                    fontFamily: message.contextEditorCfg.fontFamily,
+                                                    // 同词高亮开关：关闭时 Monaco 会顺带清掉已画出的高亮装饰
+                                                    occurrencesHighlight: message.contextEditorCfg.occurrencesHighlight ? 'singleFile' : 'off'
                                                 }
                                             );
+                                            // VSCode 括号对着色开关变化时，即时同步到当前模型（applyIndentationForModel 内含该逻辑）。
                                             applyIndentationForModel(editor.getModel());
                                             // 必须用 setTheme 显式重应用：主题名仍是 'custom-vs'，updateOptions({theme})
                                             // 会因字符串未变而短路、不重渲染；setTheme 能识别 defineTheme 生成的新主题对象并
@@ -909,9 +1273,9 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                                         }
                                     }
                                     break;
-                                case 'noSymbolFound':
+                                case 'noSymbolFound': {
                                     const models = monaco.editor.getModels();
-                                    let model = models.length > 0 ? models[0] : null;
+                                    const model = models.length > 0 ? models[0] : null;
                                     if (editor && model) {
                                         const monacoPos = {
                                             lineNumber: message.pos.line + 1,  // VS Code是0-based，Monaco是1-based
@@ -932,6 +1296,7 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                                         }
                                     }
                                     break;
+                                }
                                 case 'updateDefinitionList':
                                     // 更新定义列表
                                     if (message.definitions && Array.isArray(message.definitions)) {
@@ -948,17 +1313,38 @@ const fileContentCache = new Map();  // uri -> { version, content, metadata }
                                 case 'endProgress':
                                     document.querySelector('.progress-container').style.display = 'none';
                                     break;
+                                case 'invalidateFileCache':
+                                    handleInvalidateFileCache(message);
+                                    break;
                                 case 'updateMetadata':
+                                    lineBlame.clear();
                                     handleUpdateMetadata(message);
                                     break;
                                 case 'updateContent':
+                                    lineBlame.clear();
                                     handleUpdateContent(message);
                                     break;
+                                case 'updateSemantic':
+                                    handleUpdateSemantic(message);
+                                    break;
                                 case 'noContent':
+                                    lineBlame.clear();
                                     handleNoContent(message);
                                     break;
                                 case 'hoverResult':
                                     handleHoverResult(message);
+                                    break;
+                                case 'lineBlameResult':
+                                    lineBlame.handleResult(message);
+                                    break;
+                                case 'lineBlameDiffResult':
+                                    lineBlame.handleDiffResult(message);
+                                    break;
+                                case 'selectEnclosingSymbol.result':
+                                    mouseHandlers.handleSelectEnclosingSymbolResult(message);
+                                    break;
+                                case 'updateHistory':
+                                    jumpTrail.render(message);
                                     break;
                                 //default:
                                     //console.log('[definition] Unknown message type:', message.type);

@@ -23,8 +23,9 @@ const STICKY_CONTROLLER_ID = 'store.contrib.stickyScrollController';
 const STICKY_WIDGET_ID = 'editor.contrib.stickyScrollWidget';
 
 export function setupEditorMouseHandlers(ctx) {
+    /** @type {import('monaco-editor').editor.IStandaloneCodeEditor} */
+    const editor = ctx.editor;
     const {
-        editor,
         state,
         light,
         vscode,
@@ -71,6 +72,16 @@ export function setupEditorMouseHandlers(ctx) {
         if (!ev) { return 1; }
         return ev.detail || (ev.browserEvent && ev.browserEvent.detail) || 1;
     };
+
+    // Ctrl+F 查找框在编辑器 overlay 上。双击输入框是在选词，不是空白区双击跳转。
+    const isFindWidgetEvent = (e) => {
+        const ev = e && e.event && e.event.browserEvent;
+        const el = ev && ev.target;
+        return !!(el && typeof el.closest === 'function' && el.closest('.find-widget'));
+    };
+
+    // 行号栏双击选容器符号：用递增 reqId 丢掉过期回包。
+    let enclosingReqId = 0;
 
     // 性能优化：mouseleave 监听只在初始化时绑定一次，避免每次移动到新单词都堆叠 once 监听器（监听器泄漏）
     const editorDomForLeave = editor.getDomNode();
@@ -398,7 +409,7 @@ export function setupEditorMouseHandlers(ctx) {
     document.addEventListener('copy', (ev) => { handleStickyCopy(ev); }, true);
 
     // Ctrl/Cmd + C：必须在捕获阶段抢在 Monaco 之前处理。
-    // 编辑器的 keybinding 服务挂在编辑器 DOM 上，冒泡阶段才响应；这里用 document 捕获 +
+    // 编辑器的 keybinding 服务挂在编辑器 DOM 上，冒泡阶段才响应；这里用 document 捕获 + 
     // stopImmediatePropagation，避免 Monaco 用「空的 model 选区」执行复制、把剪贴板写成空串。
     document.addEventListener('keydown', (ev) => {
         if (!hasTriggerModifier(ev) || ev.shiftKey || ev.altKey) { return; }
@@ -473,7 +484,9 @@ export function setupEditorMouseHandlers(ctx) {
         // 挂在 widget 根节点的捕获阶段：早于 Monaco 注册在同一节点上的冒泡 click 监听。
         // 只吃「拖选刚结束」那一次，普通单击照常放行（保持 VSCode 的滚动定位行为）。
         root.addEventListener('click', (ev) => {
-            if (suppressNextStickyClick) {
+            // 拖选刚结束：吃掉紧随 click，避免 _revealPosition 毁掉选区。
+            // Pick Token Style：左键用于取色，不能再走粘附行单击跳转到该行。
+            if (suppressNextStickyClick || window.pickTokenStyle) {
                 suppressNextStickyClick = false;
                 ev.stopImmediatePropagation();
                 ev.preventDefault();
@@ -577,11 +590,11 @@ export function setupEditorMouseHandlers(ctx) {
         return true;
     }
 
-    // 右键取色流程（正文区与粘附行共用）。
+    // 取色流程（正文区与粘附行共用；Pick Token Style 开启时由左键触发）。
     // lookupPosition 必须是「单词首字符列」——见调用处注释；probeColor 是取色面板的初始色，
     // 由调用方按各自可靠的方式探测（正文区从渲染 DOM 取，粘附行直接取粘附 span 的 computed color）。
     async function runPickTokenStyle(model, lookupPosition, wordText, probeColor) {
-        // 优先用后端语义 token 识别（右键即可知道该标识符的语义类型，如 variable/function/class）；
+        // 优先用后端语义 token 识别（点击即可知道该标识符的语义类型，如 variable/function/class）；
         // 该位置无语义 token（如关键字/操作符走基础层）时，回退到 Monaco 基础 tokenizer。
         let tokenInfo = (semanticState && semanticState.data)
             ? semanticTokenAtPosition(lookupPosition, semanticState)
@@ -613,7 +626,7 @@ export function setupEditorMouseHandlers(ctx) {
             if (isSemantic) {
                 // 与 Monaco 内部 getTokenStyleMetadata 一致：
                 // 把「类型 + 修饰符」拼成 "type.mod1.mod2"（如 parameter.declaration），
-                // 右键即可看到带修饰符的完整身份，并能针对它单独配色。
+                // 点击即可看到带修饰符的完整身份，并能针对它单独配色。
                 // requestTokenStyle 内部已按最长前缀匹配用户规则、并回退到前端默认语义规则
                 // （含 *.declaration 系列），故此处直接取其结果作初值，写回目标仍是完整名。
                 token = tokenInfo.modifiers.length
@@ -667,13 +680,19 @@ export function setupEditorMouseHandlers(ctx) {
         //const isLeftClick = (e.event.buttons & 1) === 1; // 左键
         //const isRightClick = (e.event.buttons & 2) === 2; // 右键
 
+        if (isFindWidgetEvent(e)) {
+            return true;
+        }
+
         // === Sticky Scroll（粘附行）鼠标行为 ===
         // 左键：普通单击（含 shift / 双击）不拦截，交给 Monaco 自带的 CLICK 监听（滚动并定位到该行）；
         //       拖选结束（moved）时吃掉那次 click，避免 _revealPosition 把刚拖出的选区重置成单点。
+        //       Pick Token Style 开启时同样吃掉 click，只取色、不跳转到粘附行。
         // Ctrl/Cmd + 左键：跳定义。Monaco 原生这条路径走 languageFeaturesService.definitionProvider，
         //       而 webview 内没有注册 definition provider，其 ClickLinkGesture.onExecute 会静默返回，
         //       所以需要我们自己把跳转请求发回扩展端（与正文区 CONTENT_TEXT 的 jumpDefinition 同一消息）。
-        // 右键：选中单词 / 取色，与正文区一致（Monaco 原生的粘附行右键菜单已被插件统一屏蔽）。
+        // 右键：选中单词，与正文区一致（Monaco 原生的粘附行右键菜单已被插件统一屏蔽）。
+        // Pick Token Style 开启时：左键取色（无修饰键）；Ctrl/Cmd + 左键仍跳定义。
         const stickyTarget = getStickyTargetFromEvent(e);
 
         // 拖选收尾在 document 的捕获阶段就做完了（onStickyDragEnd 先于 Monaco 的 mouseup 监听），
@@ -686,6 +705,20 @@ export function setupEditorMouseHandlers(ctx) {
         // 粘附行上的普通左键单击：Monaco 会把选区重置成单点，我们画的选中反馈同步清掉
         if (stickyTarget && e.event.leftButton && !hasTriggerModifier(e.event)) {
             clearStickySelection();
+        }
+
+        if (stickyTarget && e.event.leftButton && window.pickTokenStyle && !hasTriggerModifier(e.event)) {
+            const stickyModel = editor.getModel();
+            const stickyWord = stickyModel && stickyModel.getWordAtPosition(stickyTarget.position);
+            if (stickyWord) {
+                await runPickTokenStyle(
+                    stickyModel,
+                    { lineNumber: stickyTarget.position.lineNumber, column: stickyWord.startColumn },
+                    stickyWord.word,
+                    window.getComputedStyle(stickyTarget.element).color
+                );
+            }
+            return true;
         }
 
         if (stickyTarget && e.event.leftButton && (e.event.ctrlKey || e.event.metaKey)) {
@@ -712,24 +745,12 @@ export function setupEditorMouseHandlers(ctx) {
             const stickyModel = editor.getModel();
             const stickyWord = stickyModel && stickyModel.getWordAtPosition(stickyTarget.position);
             if (stickyWord) {
-                if (window.pickTokenStyle) {
-                    // 与正文区同理：按「单词首字符列」查 token，避免落在词尾边界命中相邻标点/空白 token。
-                    // 初始色不能用 getTokenColorFromDOM——它依赖 getScrolledVisiblePosition 在正文区探点，
-                    // 而粘附行对应的正文行往往已滚出视口，探到的会是别的元素；直接读粘附 span 的渲染色最准。
-                    await runPickTokenStyle(
-                        stickyModel,
-                        { lineNumber: stickyTarget.position.lineNumber, column: stickyWord.startColumn },
-                        stickyWord.word,
-                        window.getComputedStyle(stickyTarget.element).color
-                    );
-                } else {
-                    selectStickyRange(new monaco.Range(
-                        stickyTarget.position.lineNumber,
-                        stickyWord.startColumn,
-                        stickyTarget.position.lineNumber,
-                        stickyWord.endColumn
-                    ));
-                }
+                selectStickyRange(new monaco.Range(
+                    stickyTarget.position.lineNumber,
+                    stickyWord.startColumn,
+                    stickyTarget.position.lineNumber,
+                    stickyWord.endColumn
+                ));
             }
             return true;
         }
@@ -749,9 +770,9 @@ export function setupEditorMouseHandlers(ctx) {
             const position = e.target.position;
 
             // 右键【双击】紧挨括号/引号 → 选中整对（含定界符）。移植自扩展主编辑器的双击选定，
-            // 此处严格要求「右键双击」；仅在非 pick token 且开关(doubleClickSelectsBracketPair)开启时生效。
+            // 此处严格要求「右键双击」；仅在开关(doubleClickSelectsBracketPair)开启时生效。
             // 未命中括号/引号时返回 false，继续走下方右键单击选词逻辑，故不干扰原有右键选词。
-            if (e.event.rightButton && getClickCount(e) >= 2 && !window.pickTokenStyle && window.selectBracketPairEnabled && model && position) {
+            if (e.event.rightButton && getClickCount(e) >= 2 && window.selectBracketPairEnabled && model && position) {
                 const hit = await trySelectBracketPairAt(editor, position);
                 if (hit) { hideCursor(); return true; }
             }
@@ -759,14 +780,25 @@ export function setupEditorMouseHandlers(ctx) {
             // 检查点击位置是否在当前选择范围内
             const selection = editor.getSelection();
             const isClickedTextSelected = selection && !selection.isEmpty() && selection.containsPosition(position);
-            // Repeated left clicks still start a new request so stale definition lookups are cancelled.
-            if (model && position && (!isClickedTextSelected || e.event.leftButton)) {
+            if (model && position && !isClickedTextSelected) {
                 //console.log('[definition] start to mid + jump definition: ', e);
                 const word = model.getWordAtPosition(position);
                 if (word) {
                     if (e.event.rightButton) {
-                        //console.log('[definition] start to mid + jump definition: ', word);
-                        if (window.pickTokenStyle) {
+                        editor.setSelection({
+                            startLineNumber: position.lineNumber,
+                            startColumn: word.startColumn,
+                            endLineNumber: position.lineNumber,
+                            endColumn: word.endColumn
+                        });
+                        // 右键选词后让编辑器获得键盘焦点，否则 Ctrl+F / Alt+W 等
+                        // 快捷键收不到（此前必须再左键点一下才生效）。focus() 只影响
+                        // 键盘焦点，不影响光标视觉可见性——后者由 hideCursor() 的
+                        // cursor-active class 控制，故光标仍保持隐藏。
+                        editor.focus();
+                        hideCursor();
+                    } else if (e.event.leftButton) {
+                        if (window.pickTokenStyle && !hasTriggerModifier(e.event)) {
                             // 取色一律按「用户看到的高亮单词」的起始列做 token 查找，而非鼠标原始点击列。
                             // 原因：getWordAtPosition 对词尾边界是包含的（点在 if 右边缘仍判定为 if），
                             // 而各 token 查找用的是右开区间 [startIndex, endIndex)，原始点击列若落在词尾边界，
@@ -784,30 +816,17 @@ export function setupEditorMouseHandlers(ctx) {
                                 getTokenColorFromDOM(editor, lookupPosition)
                             );
                         } else {
-                            editor.setSelection({
-                                startLineNumber: position.lineNumber,
-                                startColumn: word.startColumn,
-                                endLineNumber: position.lineNumber,
-                                endColumn: word.endColumn
-                            });
                             hideCursor();
+                            vscode.postMessage({
+                                type: 'jumpDefinition',
+                                uri: state.uri,
+                                token: word.word,
+                                position: {
+                                    line: position.lineNumber - 1,
+                                    character: position.column - 1
+                                }
+                            });
                         }
-                    } else if (e.event.leftButton) {
-                        //console.log(`[definition] start to jump definition: ${word} with uri ${uri}`);
-                        // Keep the provider position inside the word when clicking its right boundary.
-                        const definitionCharacter = Math.max(
-                            word.startColumn - 1,
-                            Math.min(position.column - 1, word.endColumn - 2)
-                        );
-                        vscode.postMessage({
-                            type: 'jumpDefinition',
-                            uri: state.uri,
-                            token: word.word,
-                            position: {
-                                line: position.lineNumber - 1,
-                                character: definitionCharacter
-                            }
-                        });
                     }
                 }
             }
@@ -816,6 +835,26 @@ export function setupEditorMouseHandlers(ctx) {
                 editor.focus();
                 showCursor();
             } else if (e.event.leftButton && getClickCount(e) >= 2) {
+                // 行号栏双击：选中当前行所属的最小函数/类/命名空间。
+                // 无论开关开还是关，都不再走 bottomArea 跳到主编辑器——关时保留 Monaco 点行号选一行。
+                if (e.target.type === monaco.editor.MouseTargetType.GUTTER_LINE_NUMBERS
+                    || e.target.type === monaco.editor.MouseTargetType.GUTTER_LINE_DECORATIONS) {
+                    const cfg = window.vsCodeEditorConfiguration && window.vsCodeEditorConfiguration.contextEditorCfg;
+                    if (cfg && cfg.contextDoubleClickSelectsSymbol === false) {
+                        return true;
+                    }
+                    const line = (e.target.position && e.target.position.lineNumber) || 0;
+                    if (line >= 1 && state.uri) {
+                        const reqId = ++enclosingReqId;
+                        vscode.postMessage({
+                            type: 'selectEnclosingSymbol',
+                            reqId,
+                            uri: state.uri,
+                            line: line - 1
+                        });
+                    }
+                    return true;
+                }
                 // 在「空白处」（非文本：CONTENT_EMPTY 等）双击 → 让 VSCode 主编辑区定位到当前上下文行。
                 // 空白处没有单词，天然不会进入上面的 jumpDefinition 分支，故无需防抖即可与单击跳转共存。
                 // 走 Monaco 的 onMouseUp（点击计数可靠），替代此前失效的原生 DOM dblclick。
@@ -828,8 +867,36 @@ export function setupEditorMouseHandlers(ctx) {
         return true;
     }
 
+    function handleSelectEnclosingSymbolResult(message) {
+        if (!message || message.reqId !== enclosingReqId) {
+            return;
+        }
+        const range = message.range;
+        if (!range) {
+            return;
+        }
+        editor.setSelection(new monaco.Range(
+            range.startLineNumber,
+            range.startColumn,
+            range.endLineNumber,
+            range.endColumn
+        ));
+        const reveal = new monaco.Range(
+            range.startLineNumber,
+            range.startColumn,
+            range.endLineNumber,
+            range.endColumn
+        );
+        if (typeof editor.revealRangeInCenterIfOutsideViewport === 'function') {
+            editor.revealRangeInCenterIfOutsideViewport(reveal);
+        } else {
+            editor.revealRangeInCenter(reveal, monaco.editor.ScrollType.Immediate);
+        }
+        hideCursor();
+    }
+
     editor.onMouseMove(handleEditorMouseMove);
     editor.onMouseUp(handleEditorMouseUp);
 
-    return { handleEditorMouseMove, handleEditorMouseUp };
+    return { handleEditorMouseMove, handleEditorMouseUp, handleSelectEnclosingSymbolResult };
 }

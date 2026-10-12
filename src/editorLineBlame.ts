@@ -1,0 +1,1305 @@
+import * as https from 'https';
+import * as vscode from 'vscode';
+import {
+    LineBlameDiffLine,
+    LineBlameHoverInfo,
+    LineBlameInfo,
+    blameLine,
+    blameLineDiff,
+    openBlameDiff
+} from './lineBlame';
+import { resolveRawTokenColors } from './themeColorResolver';
+
+/**
+ * 主编辑器当前行的 git blame 行尾注解，替代 GitLens 的同名能力。
+ *
+ * 数据全部来自 lineBlame.ts——和 Context Window 里那份行尾摘要同一个来源、
+ * 同一套缓存，所以两边显示的文字必然一致，也不会各自打一遍 git。版式也照
+ * media/lineBlame.js 那张卡片来。
+ *
+ * 但两者不可能长得一样，因为渲染的人不同：webview 那张卡片是我们自己的 DOM；
+ * 这里交给编辑器的只有 MarkdownString。字号、按下变色不在这个口子里；样式也只剩
+ * 标签一条路——VS Code 的 markdown 消毒器只在 <span> 上放行 style，且只认
+ * color / background-color / border-radius，别的标签写了 style 一律抹掉。所以
+ * 头像行的对齐与左右分布靠 supportHtml 下的 <table>，靠单元格默认的居中对齐。
+ *
+ * 拷贝例外。新版编辑器给每个 hover part 挂一颗 HoverCopyButton，默认透明，
+ * 指针进入这一行才显示——CodeBuddy 的「add to Chat」旁那颗就是它，不是他们
+ * 改了我们的 markdown。所以卡片拆成三条装饰、三个 part：作者和提交、增删、
+ * Changes。指针在哪一行，哪一行的拷贝才出现。顺带，part 之间那两根分割条也
+ * 由编辑器统一画，宽度天然一致，我们自己画不出等长的（见 buildHover）。
+ */
+
+const CONFIG_SECTION = 'contextView.editor';
+const CONFIG_ENABLED = 'lineBlame';
+const OPEN_CHANGES_COMMAND = 'contextView.editor.openLineBlameChanges';
+const COPY_COMMAND = 'contextView.editor.copyLineBlame';
+
+/**
+ * 光标停下来多久才去问 git。按住方向键连续移动时，中间每一行都问一次纯属浪费，
+ * 而 blame 是子进程调用。取值以「移动停止后几乎立刻出现」为准。
+ */
+const SETTLE_MS = 150;
+
+interface OpenChangesArgs {
+    uri: string;
+    line: number;
+    sha: string;
+    previousSha: string;
+    workingTree: boolean;
+}
+
+interface CopyArgs {
+    text: string;
+    notify: string;
+}
+
+/**
+ * markdown 链接的目标里不能出现裸的 `)`，否则链接在那里就断了。
+ * encodeURIComponent 偏偏放过圆括号，而参数里既有仓库路径（`C:\Program Files
+ * (x86)\...`）也有提交信息，所以必须自己再补上这两个字符。
+ */
+function commandLink(command: string, args: unknown): string {
+    const payload = encodeURIComponent(JSON.stringify([args]))
+        .replace(/\(/g, '%28')
+        .replace(/\)/g, '%29');
+    return `command:${command}?${payload}`;
+}
+
+function isEnabled(): boolean {
+    return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(CONFIG_ENABLED, true);
+}
+
+/**
+ * 提交信息里的 markdown 元字符必须转义后再进浮窗。浮窗为了放 command: 链接
+ * 必须 isTrusted、为了放图标必须 supportThemeIcons、为了给芯片上色必须
+ * supportHtml，而提交信息是仓库里的任意文本；不转义就等于把它当模板执行。
+ * 转义 ( ) 让正文里的 $(x) 失效，转义 < > 让它写不出标签。
+ */
+function escapeMarkdown(text: string): string {
+    return text.replace(/[\\`*_{}[\]()#+\-.!|<>~$]/g, ch => `\\${ch}`);
+}
+
+/**
+ * 把 webview 的 color-mix(in srgb, fg N%, transparent) 算成不透明色。
+ * 浮窗的 <span style> 只认写死的十六进制，透明底会变成发灰的脏色。
+ */
+function mixOn(fg: string, amount: number, bg: string): string {
+    const parse = (hex: string): [number, number, number] => {
+        const n = parseInt(hex.slice(1), 16);
+        return [n >> 16, (n >> 8) & 255, n & 255];
+    };
+    const [fr, fgC, fb] = parse(fg);
+    const [br, bgC, bb] = parse(bg);
+    const mix = (a: number, b: number) => Math.round(a * amount + b * (1 - amount));
+    const hex = (n: number) => n.toString(16).padStart(2, '0');
+    return `#${hex(mix(fr, br))}${hex(mix(fgC, bgC))}${hex(mix(fb, bb))}`;
+}
+
+/**
+ * 芯片和工作区颜色照 media/main.css 的 .cw-line-blame-hover-sha。
+ * 底色是 color-mix 16%/22% 叠在浮窗底上，这里预先混好。
+ */
+interface Palette {
+    commit: string;
+    commitBackground: string;
+    parent: string;
+    parentBackground: string;
+    muted: string;
+    icon: string;
+    hoverBackground: string;
+}
+
+function palette(): Palette {
+    const kind = vscode.window.activeColorTheme?.kind;
+    const dark = kind === vscode.ColorThemeKind.Dark || kind === vscode.ColorThemeKind.HighContrast;
+    if (dark) {
+        const hoverBackground = '#252526';
+        return {
+            commit: '#3fb950',
+            commitBackground: mixOn('#3fb950', 0.22, hoverBackground),
+            parent: '#9d9d9d',
+            parentBackground: mixOn('#9d9d9d', 0.18, hoverBackground),
+            muted: '#9d9d9d',
+            icon: '#c5c5c5',
+            hoverBackground
+        };
+    }
+    const hoverBackground = '#ffffff';
+    return {
+        commit: '#16825d',
+        commitBackground: mixOn('#16825d', 0.16, hoverBackground),
+        parent: '#6a6a6a',
+        parentBackground: mixOn('#6a6a6a', 0.18, hoverBackground),
+        muted: '#6a6a6a',
+        icon: '#616161',
+        hoverBackground
+    };
+}
+
+function tint(color: string, markdown: string): string {
+    return `<span style="color:${color};">${markdown}</span>`;
+}
+
+/**
+ * 内联 SVG，markdown 图片写法。
+ *
+ * 别改成 <img> 标签：这些图标出现在芯片的链接文字里（`[图标+SHA](command:…)`），
+ * 而链接的提示和点击全靠渲染后那趟 <a> 巡检——它读 href，读不到合规值就把整个
+ * <a> 拆掉、只留下里面的内容。那正是「芯片还在、提示和点击都没了」的样子。
+ * 图片语法是这套芯片一直用的形态，不要为了别处的排版去动它。
+ *
+ * data URI 里的括号不用额外编码：CommonMark 允许目标里出现成对括号，
+ * 而 SVG 里的 translate(...) / rotate(...) 都是成对的。
+ */
+function svgImage(svg: string): string {
+    return `![](data:image/svg+xml,${encodeURIComponent(svg)})`;
+}
+
+/** 插件芯片左侧那个旋转过的 git 节点，12×12。图形下移 2px，跟旁边的 SHA 对齐。 */
+function gitNodeImage(color: string): string {
+    return svgImage(
+        `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="12" height="12">`
+        + `<g transform="translate(0 2.7)">`
+        + `<path fill="${color}" transform="rotate(90 8 8)" d="M11.5 8C11.5 6.24 10.194 4.779 8.5 4.536V1.5C8.5 1.224 8.276 1 8 1C7.724 1 7.5 1.224 7.5 1.5V4.536C5.806 4.779 4.5 6.24 4.5 8C4.5 9.76 5.806 11.221 7.5 11.464V14.5C7.5 14.776 7.724 15 8 15C8.276 15 8.5 14.776 8.5 14.5V11.464C10.194 11.221 11.5 9.76 11.5 8ZM8 10.5C6.621 10.5 5.5 9.378 5.5 8C5.5 6.622 6.621 5.5 8 5.5C9.379 5.5 10.5 6.622 10.5 8C10.5 9.378 9.379 10.5 8 10.5Z"/>`
+        + `</g></svg>`
+    );
+}
+
+/**
+ * 插件 Open Changes 按钮里的 16×16 图标，浮窗只显示这个，不带文字。
+ *
+ * 图片底边坐在基线上，盒子加高只会往上长，所以位置只能在 16×16 盒子里调。
+ * 墨迹占网格 y=1..15（14px），顶边落在 y=3 才跟 SHA 芯片对齐；整体下移 2px
+ * 底边就到 17，被盒子裁掉 1px。所以顶边钉在 3，按 13/14 等比缩到底边 16，
+ * 水平绕中线缩。
+ */
+const OPEN_CHANGES_SCALE = 13 / 14;
+const OPEN_CHANGES_DX = 8 * (1 - OPEN_CHANGES_SCALE);
+const OPEN_CHANGES_DY = 3 - OPEN_CHANGES_SCALE;
+
+function openChangesImage(color: string): string {
+    return svgImage(
+        `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">`
+        + `<g transform="translate(${OPEN_CHANGES_DX.toFixed(4)} ${OPEN_CHANGES_DY.toFixed(4)}) scale(${OPEN_CHANGES_SCALE.toFixed(4)})">`
+        + `<path fill="${color}" d="M9.14645 5.85355C9.34171 6.04882 9.65829 6.04882 9.85355 5.85355C10.0488 5.65829 10.0488 5.34171 9.85355 5.14645L8.70711 4H10.5C11.3284 4 12 4.67157 12 5.5V10.05C10.8589 10.2816 10 11.2905 10 12.5C10 13.8807 11.1193 15 12.5 15C13.8807 15 15 13.8807 15 12.5C15 11.2905 14.1411 10.2816 13 10.05V5.5C13 4.11929 11.8807 3 10.5 3H8.70711L9.85355 1.85355C10.0488 1.65829 10.0488 1.34171 9.85355 1.14645C9.65829 0.951184 9.34171 0.951184 9.14645 1.14645L7.14645 3.14645C6.95118 3.34171 6.95118 3.65829 7.14645 3.85355L9.14645 5.85355ZM14 12.5C14 13.3284 13.3284 14 12.5 14C11.6716 14 11 13.3284 11 12.5C11 11.6716 11.6716 11 12.5 11C13.3284 11 14 11.6716 14 12.5ZM6 3.5C6 4.70948 5.14112 5.71836 4 5.94999V10.5C4 11.3284 4.67157 12 5.5 12H7.29289L6.14645 10.8536C5.95118 10.6583 5.95118 10.3417 6.14645 10.1464C6.34171 9.95118 6.65829 9.95118 6.85355 10.1464L8.85355 12.1464C9.04882 12.3417 9.04882 12.6583 8.85355 12.8536L6.85355 14.8536C6.65829 15.0488 6.34171 15.0488 6.14645 14.8536C5.95118 14.6583 5.95118 14.3417 6.14645 14.1464L7.29289 13H5.5C4.11929 13 3 11.8807 3 10.5V5.94999C1.85888 5.71836 1 4.70948 1 3.5C1 2.11929 2.11929 1 3.5 1C4.88071 1 6 2.11929 6 3.5ZM5 3.5C5 2.67157 4.32843 2 3.5 2C2.67157 2 2 2.67157 2 3.5C2 4.32843 2.67157 5 3.5 5C4.32843 5 5 4.32843 5 3.5Z"/>`
+        + `</g></svg>`
+    );
+}
+
+/**
+ * webview 里的 SHA 芯片：git 节点 + 短 SHA，连图标一起有底色，点了拷贝完整 SHA。
+ * 颜色按 .cw-line-blame-hover-sha / -current 预先混好。
+ */
+function shaChip(shortSha: string, fullSha: string, parent = false): string {
+    const colors = palette();
+    const fg = parent ? colors.parent : colors.commit;
+    const bg = parent ? colors.parentBackground : colors.commitBackground;
+    const label = shortSha.replace(/[`<>]/g, '');
+    const chip = [
+        `<span style="color:${fg};background-color:${bg};">`,
+        `&nbsp;${gitNodeImage(fg)} ${label}&nbsp;`,
+        '</span>'
+    ].join('');
+    const args: CopyArgs = { text: fullSha || shortSha, notify: 'SHA copied' };
+    return `[${chip}](${commandLink(COPY_COMMAND, args)} "Copy SHA")`;
+}
+
+/**
+ * 保留 Gravatar 的 d=404：没登记头像时让它直接 404，我们才好换成首字母牌子，
+ * 和 media/lineBlame.js 一样。换成 d=mp 只会拿到一张所有人都一样的灰人像。
+ */
+function avatarSrc(hover: LineBlameHoverInfo): string | undefined {
+    const url = hover.avatarUrl;
+    if (!url) {
+        return undefined;
+    }
+    const retina = url.replace(/([?&])s=\d+\b/, '$1s=64');
+    return /[?&]s=\d+/.test(retina)
+        ? retina
+        : `${retina}${retina.includes('?') ? '&' : '?'}s=64`;
+}
+
+function whenText(hover: LineBlameHoverInfo): string {
+    return hover.ago && hover.date
+        ? `${hover.ago} (${hover.date})`
+        : hover.ago || hover.date || '';
+}
+
+function escapeHtml(text: string): string {
+    return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function htmlImg(src: string, width: number, height: number): string {
+    return `<img src="${escapeHtml(src)}" width="${width}" height="${height}" alt="">`;
+}
+
+/**
+ * 头像。webview 那边自己 fetch，失败就退回首字母牌子（media/lineBlame.js 的
+ * makeAvatar）；浮窗里我们只能交出一段 markdown，<img> 加载成没成功看不见，
+ * 所以把顺序倒过来：在扩展宿主先把图取回来内联成 data URI，取不到——作者没登记
+ * Gravatar（404）、断网、被代理挡住——就直接画同一套首字母牌子，不留一个空洞。
+ */
+const AVATAR_PX = 28;
+const AVATAR_MAX_BYTES = 512 * 1024;
+const AVATAR_TIMEOUT_MS = 5000;
+/** 拉失败不是永久结论：作者以后可能补登记头像，隔一段时间再试一次。 */
+const AVATAR_RETRY_MS = 10 * 60 * 1000;
+
+/** src 为 null 表示这一轮没拉到；at 用来隔一阵子再试。 */
+type AvatarEntry = { src: string | null; at: number };
+
+/** 整个会话共用：光标在同一提交的相邻行之间移动时不会重复走网络。 */
+const avatarCache = new Map<string, AvatarEntry>();
+const avatarInflight = new Map<string, Promise<string | null>>();
+
+function cachedAvatar(url: string): string | undefined {
+    return avatarCache.get(url)?.src || undefined;
+}
+
+function shouldFetchAvatar(url: string): boolean {
+    const hit = avatarCache.get(url);
+    if (!hit) {
+        return true;
+    }
+    return hit.src ? false : Date.now() - hit.at >= AVATAR_RETRY_MS;
+}
+
+function fetchAvatar(url: string, redirects = 2): Promise<string | null> {
+    return new Promise(resolve => {
+        let settled = false;
+        const done = (value: string | null) => {
+            if (!settled) {
+                settled = true;
+                resolve(value);
+            }
+        };
+        if (!/^https:/i.test(url)) {
+            done(null);
+            return;
+        }
+        try {
+            const req = https.get(
+                url,
+                {
+                    headers: { 'user-agent': 'vscode-context-window', accept: 'image/*' },
+                    timeout: AVATAR_TIMEOUT_MS
+                },
+                res => {
+                    const status = res.statusCode || 0;
+                    const location = res.headers.location;
+                    if (status >= 300 && status < 400 && location && redirects > 0) {
+                        res.resume();
+                        fetchAvatar(new URL(location, url).toString(), redirects - 1).then(done, () => done(null));
+                        return;
+                    }
+                    const type = String(res.headers['content-type'] || '').split(';')[0].trim();
+                    if (status !== 200 || !/^image\//i.test(type)) {
+                        res.resume();
+                        done(null);
+                        return;
+                    }
+                    const chunks: Buffer[] = [];
+                    let size = 0;
+                    res.on('data', (chunk: Buffer) => {
+                        size += chunk.length;
+                        if (size > AVATAR_MAX_BYTES) {
+                            res.destroy();
+                            done(null);
+                            return;
+                        }
+                        chunks.push(chunk);
+                    });
+                    res.on('end', () => done(`data:${type};base64,${Buffer.concat(chunks).toString('base64')}`));
+                    res.on('error', () => done(null));
+                }
+            );
+            req.on('timeout', () => {
+                req.destroy();
+                done(null);
+            });
+            req.on('error', () => done(null));
+        } catch {
+            done(null);
+        }
+    });
+}
+
+function loadAvatar(url: string): Promise<string | null> {
+    const pending = avatarInflight.get(url);
+    if (pending) {
+        return pending;
+    }
+    const job = fetchAvatar(url).then(src => {
+        avatarCache.set(url, { src, at: Date.now() });
+        avatarInflight.delete(url);
+        return src;
+    }, () => {
+        avatarCache.set(url, { src: null, at: Date.now() });
+        avatarInflight.delete(url);
+        return null;
+    });
+    avatarInflight.set(url, job);
+    return job;
+}
+
+function avatarLetter(name: string): string {
+    const s = String(name || '').trim();
+    return s ? [...s][0].toUpperCase() : '?';
+}
+
+// 与 media/lineBlame.js 同一张色表：按首字母分段（A–C / D–F / …），白字保证对比度。
+const AVATAR_COLORS = [
+    '#c0392b', // A–C
+    '#d35400', // D–F
+    '#b7950b', // G–I
+    '#1e8449', // J–L
+    '#148f77', // M–O
+    '#2471a3', // P–R
+    '#6c3483', // S–U
+    '#7d3c98'  // V–Z 及其它
+];
+
+function avatarColor(name: string): string {
+    const letter = avatarLetter(name);
+    const code = letter.charCodeAt(0);
+    const idx = code >= 65 && code <= 90
+        ? Math.min(AVATAR_COLORS.length - 1, Math.floor((code - 65) * AVATAR_COLORS.length / 26))
+        : (letter.codePointAt(0) || 0) % AVATAR_COLORS.length;
+    return AVATAR_COLORS[idx];
+}
+
+/** 首字母牌子。圆角、字号、配色照 .cw-line-blame-hover-avatar-letter。 */
+function letterAvatarUri(name: string): string {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${AVATAR_PX}" height="${AVATAR_PX}" viewBox="0 0 28 28">`
+        + `<rect width="28" height="28" rx="6" ry="6" fill="${avatarColor(name)}"/>`
+        + `<text x="14" y="14" fill="#ffffff" font-family="sans-serif" font-size="14" font-weight="600"`
+        + ` text-anchor="middle" dominant-baseline="central">${escapeHtml(avatarLetter(name))}</text>`
+        + `</svg>`;
+    return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
+
+function avatarImage(hover: LineBlameHoverInfo): string {
+    const url = avatarSrc(hover);
+    const src = (url && cachedAvatar(url)) || letterAvatarUri(hover.authorName || hover.author || '');
+    return htmlImg(src, AVATAR_PX, AVATAR_PX);
+}
+
+/** 1×1 透明 PNG。浮窗里的 <img width> 会按属性拉伸，不依赖 SVG 固有尺寸。 */
+const PIXEL_PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+
+function spacer(width: number, height = 1): string {
+    return htmlImg(PIXEL_PNG, Math.max(1, Math.round(width)), height);
+}
+
+/**
+ * 时钟图标，和旁边的时间文字对齐。
+ *
+ * 行内图片是坐在基线上的，它所在的行框下面还挂着字体的下沿空间，所以图片盒的
+ * 中线比行框中线高出半个下沿——图标看着就比文字高一点。跟 gitNodeImage、
+ * openChangesImage 一个路子：把图形画到一个更高的盒子的下半部，图形中线就正好
+ * 落回行框中线。盒子高 CLOCK_BOX_PX、图形高 CLOCK_PX，差出来的就是那半个下沿。
+ */
+const CLOCK_PX = 14;
+const CLOCK_BOX_PX = 18;
+/** 视野框跟着等比拉高，避免非等比缩放把圆压扁。 */
+const CLOCK_VIEW_H = (16 * CLOCK_BOX_PX) / CLOCK_PX;
+
+function clockImage(color: string): string {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 ${CLOCK_VIEW_H.toFixed(2)}"`
+        + ` width="${CLOCK_PX}" height="${CLOCK_BOX_PX}">`
+        + `<g transform="translate(0 ${(CLOCK_VIEW_H - 16).toFixed(2)})">`
+        + `<path fill="${color}" d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 1.25a5.75 5.75 0 1 1 0 11.5 5.75 5.75 0 0 1 0-11.5zM8.5 4v4.05l2.6 1.5-.5.87L7.5 8.55V4h1z"/>`
+        + `</g></svg>`;
+    return htmlImg(`data:image/svg+xml,${encodeURIComponent(svg)}`, CLOCK_PX, CLOCK_BOX_PX);
+}
+
+/**
+ * 卡片宽度区间，跟插件 .cw-line-blame-hover 一样：520–720。
+ *
+ * 官方浮窗没有 CSS 口子，两头都得自己想办法。下限靠头像那行里塞一张定宽透明图
+ * 撑出来；上限只能靠预先折行——编辑器给浮窗的 max-width 是
+ * `max(编辑器宽 * 0.66, 750)`，屏幕一宽就是一千多像素，而一段中文正文可以一直
+ * 摊到那里才折。所以正文和增删都按下面这个预算自己断行，让内容根本够不到
+ * 编辑器那个上限，卡片自然就停在 720。
+ */
+const HOVER_MIN_PX = 520;
+const HOVER_MAX_PX = 720;
+
+/** 正文可用宽度：内容区左右内边距各 8px，右侧再留 20px 给拷贝按钮。 */
+const CONTENT_PAD_PX = 36;
+/** 代码块自己还有一圈内边距。 */
+const CODE_PAD_PX = 56;
+
+const MONO_PX = 8.4;
+const TEXT_PX = 7.2;
+
+/**
+ * 中日韩文字和全角标点占两个西文字身位。不把它们算成两倍，一行中文的实际宽度
+ * 就是估算的两倍，折行等于没做——截图里那张铺满屏幕的卡片就是这么来的。
+ */
+const WIDE_CHAR = /[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uA960-\uA97F\uAC00-\uD7A3\uF900-\uFAFF\uFE10-\uFE19\uFE30-\uFE6F\uFF00-\uFF60\uFFE0-\uFFE6]/;
+
+function charPx(ch: string, unit: number): number {
+    return WIDE_CHAR.test(ch) ? unit * 2 : unit;
+}
+
+function textPx(text: string, unit: number): number {
+    let px = 0;
+    for (const ch of text) {
+        px += charPx(ch, unit);
+    }
+    return px;
+}
+
+type Token = { text: string; space: boolean; px: number };
+
+/** 西文词和网址整块不拆，中文逐字可断，空白单独成块——就是折行的最小单位。 */
+function tokenize(text: string, unit: number): Token[] {
+    const out: Token[] = [];
+    let word = '';
+    const flush = () => {
+        if (word) {
+            out.push({ text: word, space: false, px: textPx(word, unit) });
+            word = '';
+        }
+    };
+    for (const ch of text) {
+        if (/\s/.test(ch)) {
+            flush();
+            out.push({ text: ch, space: true, px: unit });
+        } else if (WIDE_CHAR.test(ch)) {
+            flush();
+            out.push({ text: ch, space: false, px: unit * 2 });
+        } else {
+            word += ch;
+        }
+    }
+    flush();
+    return out;
+}
+
+/**
+ * 按像素预算折行。一个词本身就超预算时（长网址）让它自己占一行，宁可越界也不
+ * 切断：切开的网址不再会被识别成可点的链接。
+ */
+function wrapText(text: string, budget: number): string[] {
+    const lines: string[] = [];
+    let line = '';
+    let px = 0;
+    for (const token of tokenize(text, TEXT_PX)) {
+        if (line && px + token.px > budget) {
+            lines.push(line);
+            line = token.space ? '' : token.text;
+            px = token.space ? 0 : token.px;
+            continue;
+        }
+        if (token.space && !line) {
+            // 折到新行以后，行首那个空格没有意义
+            continue;
+        }
+        line += token.text;
+        px += token.px;
+    }
+    if (line) {
+        lines.push(line);
+    }
+    return lines.map(l => l.replace(/\s+$/, '')).filter(l => l.length > 0);
+}
+
+/**
+ * 整张卡片按内容该有多宽。取正文和增删里最宽的那行，卡进 520–720。
+ *
+ * 这个值只有头部要用，而头部偏偏是最需要它的地方：头部和增删分属不同的
+ * hover part，而每个 part 的 .hover-row 是 display:flex，flex 主轴上的项目
+ * 默认 flex:0 1 auto——不会被拉开去填满行宽。所以头部那个 part 只按自己的内容
+ * 收缩，表格的 width="100%" 是相对这个收缩后的盒子解析的，跟增删撑出来的整卡
+ * 宽度无关。增删一长，时间就停在半路。头部必须自己算出整卡多宽，再用透明图
+ * 把这一行垫到那么宽。
+ */
+function cardWidthPx(hover: LineBlameHoverInfo, diff: readonly LineBlameDiffLine[]): number {
+    const widest = Math.max(
+        HOVER_MIN_PX,
+        messageWidthPx(hover.summary || ''),
+        diffWidthPx(diff)
+    );
+    return Math.min(HOVER_MAX_PX, Math.round(widest));
+}
+
+/** 提交信息折好后最宽那行占多少像素。空信息返回 0。 */
+function messageWidthPx(message: string): number {
+    const budget = HOVER_MAX_PX - CONTENT_PAD_PX;
+    let widest = 0;
+    for (const source of message.split(/\r?\n/)) {
+        for (const line of wrapText(source.trim(), budget)) {
+            widest = Math.max(widest, textPx(line, TEXT_PX));
+        }
+    }
+    return widest ? CONTENT_PAD_PX + widest : 0;
+}
+
+/**
+ * 头像行里那张透明图的宽度：把这一行垫到整卡宽度。名字和时间按估算宽度扣掉，
+ * 估偏一点只是让垫片多退或少退几像素，时间贴右边靠单元格的 align，不靠它。
+ */
+function headerGapPx(hover: LineBlameHoverInfo, diff: readonly LineBlameDiffLine[]): number {
+    const who = hover.author || hover.authorName || 'Someone';
+    const when = whenText(hover);
+    const left = AVATAR_PX + 10 + textPx(who, 8.5);
+    const right = when ? 20 + textPx(when, 6.6) : 0;
+    return Math.max(24, cardWidthPx(hover, diff) - CONTENT_PAD_PX - Math.round(left + right));
+}
+
+/**
+ * 让一段文字不折行。名字那格 width="100%" 会把其余格子压到各自的最小折行宽度，
+ * 时间就被挤成了一列竖排。`nowrap` 不在消毒器的属性白名单里，style 又只在
+ * <span> 上认那三条颜色属性，所以只能从文本下手：空格换成不换行空格，这一格的
+ * 最小宽度就等于整串的宽度，表格自然会把它留成一行。
+ */
+function noWrap(text: string): string {
+    return text.replace(/ /g, '&nbsp;');
+}
+
+/**
+ * 头像和名字这一行。行内图片是按基线摆的——图的下沿落在文字基线上，所以 28px 的
+ * 头像整个悬在文字上方，和 webview 里 `align-items: center` 的那一行对不上。
+ * 浮窗又没有 CSS 口子：VS Code 的 markdown 消毒器只在 <span> 上放行 style，
+ * 且只认 color / background-color / border-radius，vertical-align 会被直接抹掉。
+ *
+ * 所以改用单行表格。单元格默认就是 vertical-align: middle，头像、名字、时钟、
+ * 时间各占一格，天然按中线对齐，等价于 webview 那套 flex。左右分布则靠名字那格
+ * 的 width="100%" 把右边两格顶到右端，再由 headerGapPx 那张透明图把整行垫到
+ * 卡片该有的宽度——单靠 width="100%" 不够，见 cardWidthPx 的说明。width 和
+ * align 是消毒器白名单里的属性，style 才是被拦的那个。
+ *
+ * 时钟和时间必须是两格，不能塞进同一格：同一格里图片和文字之间存在断行机会，
+ * 被压到最小宽度时就会从那里断开，图标独占一行。而同一行的单元格永远并排，
+ * 不可能上下分开。
+ */
+function appendHeader(
+    md: vscode.MarkdownString,
+    hover: LineBlameHoverInfo,
+    diff: readonly LineBlameDiffLine[]
+): void {
+    const who = escapeHtml(hover.author || hover.authorName || 'Someone');
+    const when = escapeHtml(whenText(hover));
+    const colors = palette();
+    // 垫宽的透明图跟着名字走：它把这一格的最小宽度顶到整卡该有的宽度。
+    // 名字不锁行：它那格 width="100%" 会先分到所有余量，只有整行实在放不下时
+    // 才会折——那时候让长名字折，好过把卡片撑破。
+    const cells = [
+        `<td>${avatarImage(hover)}</td>`,
+        `<td width="100%">&nbsp;<strong>${who}</strong>${spacer(headerGapPx(hover, diff))}</td>`
+    ];
+    if (when) {
+        cells.push(`<td>${clockImage(colors.muted)}</td>`);
+        cells.push(
+            `<td align="right"><span style="color:${colors.muted};">`
+            + `&nbsp;${noWrap(when)}</span></td>`
+        );
+    }
+    // 整张表写在一行里：markdown 的 HTML 块要到空行才结束，中途换行会把后面的
+    // 提交信息一起吞进原样 HTML。
+    md.appendMarkdown(`<table width="100%"><tr>${cells.join('')}</tr></table>\n\n`);
+}
+
+/** 一段正文。作者自己的换行保留，太长的行按预算再折。 */
+function appendParagraph(
+    md: vscode.MarkdownString,
+    sourceLines: readonly string[],
+    muted = false
+): void {
+    const budget = HOVER_MAX_PX - CONTENT_PAD_PX;
+    const out: string[] = [];
+    for (const source of sourceLines) {
+        const wrapped = wrapText(source, budget);
+        if (wrapped.length) {
+            out.push(...wrapped.map(line => escapeMarkdown(line)));
+        } else {
+            // 作者留的空行，照原样留着
+            out.push('');
+        }
+    }
+    while (out.length && !out[out.length - 1]) {
+        out.pop();
+    }
+    if (out.length) {
+        const lines = muted
+            ? out.map(line => line && tint(BODY_FOREGROUND, line))
+            : out;
+        md.appendMarkdown(`${lines.join('  \n')}\n\n`);
+    }
+}
+
+/**
+ * 正文文字颜色，跟 webview 卡片同一套（.cw-line-blame-hover-body 的
+ * color: var(--vscode-descriptionForeground)）：首行标题用前景色，正文用描述色，
+ * 层次和那边一致。span 的 style 只认 color/background-color/border-radius，
+ * 但 color 允许直接写 var(--vscode-…)，所以跟主题走，不用按明暗挑死值。
+ */
+const BODY_FOREGROUND = 'var(--vscode-descriptionForeground)';
+
+/** 首行是标题、其余是正文，和 webview 的 summary / body 一致。 */
+function appendMessage(md: vscode.MarkdownString, message: string): void {
+    const lines = message.split(/\r?\n/).map(line => line.trim());
+    while (lines.length && !lines[lines.length - 1]) {
+        lines.pop();
+    }
+    if (!lines.length) {
+        return;
+    }
+    const body = lines.slice(1);
+    while (body.length && !body[0]) {
+        body.shift();
+    }
+    if (lines[0]) {
+        appendParagraph(md, [lines[0]]);
+    }
+    if (body.some(line => line)) {
+        appendParagraph(md, body, true);
+    }
+}
+
+/**
+ * 代码行折行。和 webview 的 `word-break: break-word` 同一套取舍：优先在空白处
+ * 断，只有一个词本身就超预算时才在词内断——不然会像逐字符折行那样把
+ * `CS.UnityEngine.Bounds` 从中间劈开。
+ *
+ * 和 wrapText 的区别是词内允许断：这里的「词」是标识符，切开只是难看；
+ * 而正文里的长词往往是网址，切开就不再是可点的链接了。
+ */
+function wrapCode(text: string, budget: number): string[] {
+    const lines: string[] = [];
+    let line = '';
+    let px = 0;
+    for (const token of tokenize(text, MONO_PX)) {
+        // 折到新行以后，行首那些空格没有意义
+        if (token.space && !line) {
+            continue;
+        }
+        if (line && px + token.px > budget) {
+            lines.push(line);
+            line = '';
+            px = 0;
+            if (token.space) {
+                continue;
+            }
+        }
+        if (token.px > budget) {
+            // 单独占一行也放不下的长标识符：只能在词内断
+            let chunk = '';
+            let chunkPx = 0;
+            for (const ch of token.text) {
+                const w = charPx(ch, MONO_PX);
+                if (chunk && chunkPx + w > budget) {
+                    lines.push(chunk);
+                    chunk = '';
+                    chunkPx = 0;
+                }
+                chunk += ch;
+                chunkPx += w;
+            }
+            line = chunk;
+            px = chunkPx;
+            continue;
+        }
+        line += token.text;
+        px += token.px;
+    }
+    if (line) {
+        lines.push(line);
+    }
+    return lines.length ? lines : [''];
+}
+
+/**
+ * 当前行的增删，配色自己做，不借 ```diff 的语法着色。
+ *
+ * 借语法着色的话续行必须重复 `+` / `-`：那份语法的 15 条规则里除注释外全是
+ * `^` 行首锚定的单行 match（`markup.inserted.diff` 是 `^(((>)( .*)?)|((\+).*))$`），
+ * 空白开头的续行落不到任何规则上就会掉色。而折行是躲不掉的——表头的时间靠
+ * 透明图垫到卡片宽度才能右对齐，卡片多宽只有我自己折行时才知道。
+ *
+ * 所以照 media/lineBlame.js 的 renderDiff 那样逐行上色：标记只出现在首行，
+ * 续行照样有颜色，`+` / `-` 还能单独取操作符色（见 diffBlock / operatorColor）。
+ */
+function diffRows(diff: readonly LineBlameDiffLine[]): { kind: LineBlameDiffLine['kind']; text: string }[] {
+    // 行不会自己折行（也不该靠它折，宽度得是已知的），超出的部分按预算断开。
+    // 预算里先扣掉行首那两格，续行才对得齐。
+    const budget = HOVER_MAX_PX - CODE_PAD_PX - MONO_PX * 2;
+    const rows: { kind: LineBlameDiffLine['kind']; text: string }[] = [];
+    for (const line of diff) {
+        const mark = line.kind === 'del' ? '-' : line.kind === 'add' ? '+' : ' ';
+        // 和 webview 一样去掉行首缩进：浮窗窄，缩进只会把内容挤出视野。
+        const text = String(line.text || '').replace(/^[ \t]+/, '');
+        // 首行是 `+ ` / `- `，续行用两格空白顶头对齐；颜色由 span 给，与标记无关。
+        const wrapped = wrapCode(text, budget);
+        for (let i = 0; i < wrapped.length; i++) {
+            rows.push({
+                kind: line.kind,
+                text: `${i === 0 ? mark : ' '} ${wrapped[i]}`
+            });
+        }
+    }
+    return rows;
+}
+
+/** 增删折好后最宽那行占多少像素。没有增删时返回 0。 */
+function diffWidthPx(diff: readonly LineBlameDiffLine[]): number {
+    let widest = 0;
+    for (const row of diffRows(diff)) {
+        widest = Math.max(widest, textPx(row.text, MONO_PX));
+    }
+    return widest ? CODE_PAD_PX + widest : 0;
+}
+
+/**
+ * 增删的行色，照 media/main.css 的 .cw-line-blame-hover-diff-* 取值：
+ * 新增那两个绿是 webview 里写死的，删除和上下文跟着主题变量走。
+ */
+function diffColor(kind: LineBlameDiffLine['kind']): string {
+    const theme = vscode.window.activeColorTheme?.kind;
+    const dark = theme === vscode.ColorThemeKind.Dark || theme === vscode.ColorThemeKind.HighContrast;
+    if (kind === 'add') {
+        return dark ? '#3fb950' : '#16825D';
+    }
+    if (kind === 'del') {
+        return 'var(--vscode-gitDecoration-deletedResourceForeground)';
+    }
+    return 'var(--vscode-descriptionForeground)';
+}
+
+/**
+ * 行首 `+` / `-` 的颜色。照 media/main.css 的 .cw-line-blame-hover-diff-mark：
+ * 不跟增删同色，而是取当前主题的操作符色（`+` 在编辑器里就是这个色），
+ * 解析不到时用 Light+ / Dark+ 那个偏紫的兜底。
+ *
+ * webview 那边从 window.vsCodeEditorConfiguration 里现成的规则表查；扩展这边
+ * 直接问 themeColorResolver。它要读并解析主题 JSON，不能每次浮窗都来一遍，
+ * 所以缓存住，换主题时由 registerEditorLineBlame 清掉。
+ */
+let operatorColorCache: string | undefined;
+
+function toCssColor(raw: string): string {
+    const s = raw.trim();
+    if (!s) {
+        return '';
+    }
+    // themeColorResolver 下发的 foreground 不带 '#'（是给 Monaco 用的）
+    return /^[0-9a-fA-F]{6,8}$/.test(s) ? `#${s}` : s;
+}
+
+function operatorColor(): string {
+    if (operatorColorCache !== undefined) {
+        return operatorColorCache;
+    }
+    let color = '';
+    try {
+        const rules = resolveRawTokenColors() || [];
+        // 和 webview 的 pickRuleColor 一样从后往前找：同名 scope 后者优先。
+        // 不用泛化的 operator，Light+ 下那个是前景黑。
+        for (const scope of ['keyword.operator.arithmetic', 'keyword.operator']) {
+            for (let i = rules.length - 1; i >= 0 && !color; i--) {
+                if (rules[i].token === scope && rules[i].foreground) {
+                    color = toCssColor(rules[i].foreground as string);
+                }
+            }
+            if (color) {
+                break;
+            }
+        }
+    } catch {
+        color = '';
+    }
+    if (!color) {
+        const theme = vscode.window.activeColorTheme?.kind;
+        const dark = theme === vscode.ColorThemeKind.Dark || theme === vscode.ColorThemeKind.HighContrast;
+        color = dark ? '#C586C0' : '#800080';
+    }
+    operatorColorCache = color;
+    return color;
+}
+
+/** 空格必须转成不换行空格：浮窗里 white-space 是 normal，行首缩进会被吃掉。 */
+function keepSpaces(text: string): string {
+    return escapeHtml(text).replace(/ /g, '&nbsp;');
+}
+
+/**
+ * Changes 行里两个 SHA 之间那个双箭头。形状照 codicon `arrow-both` 复刻，
+ * 但自己画成 <img>，因为要能再往上抬一点。
+ *
+ * 直接用 `$(arrow-both)` 的话位置动不了：codicon 的垂直位置全由浮窗自己的
+ * CSS 定死——`vertical-align: middle` 加它自带的 `margin-bottom: 2px`，而这
+ * 两个属性都不在 <span> 的 style 白名单里（只放行 color / background-color /
+ * border-radius）。<img> 才是唯一位置可控的元素：width / height / align 都在
+ * 属性白名单上，而且行内图片是坐在基线上的，把 16 网格贴着盒子下沿画，
+ * 抬多高完全由我定。
+ *
+ * 之前手画偏大是因为按 em 框的尺寸去画（`↔` 字符的墨迹远小于 em 框）。这回
+ * 直接照 codicon 的 16 网格来：渲染宽度 SEP_W 就是它在浮窗字号下的大小，
+ * 描边按缩放比落到 1px 以内，所以看着还是那个箭头。
+ */
+/** codicon 的设计网格。 */
+const SEP_GRID = 16;
+/** 渲染宽度，对齐 codicon 在浮窗字号下的实际大小。 */
+const SEP_W = 14;
+/** 盒子高度，只用来给抬升留地方，不影响观感。 */
+const SEP_BOX_H = 16;
+/**
+ * 箭头中线离基线多高。这是唯一的位置旋钮：要再往上就加大它。
+ * codicon 原本落在「基线 + 半个 x 高 + 2px」≈ 5.5px，这里取 6.5 即再抬 1px。
+ */
+const SEP_CENTER_PX = 5.5;
+
+function separatorImage(color: string): string {
+    const scale = SEP_W / SEP_GRID;
+    // 网格贴着盒子下沿放，再把整格上移，使网格的 y=8（箭头中线）
+    // 正好落在离盒底 SEP_CENTER_PX 的位置。
+    const offsetPx = SEP_BOX_H - SEP_CENTER_PX - (SEP_GRID / 2) * scale;
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg"`
+        + ` viewBox="0 0 ${SEP_GRID} ${(SEP_BOX_H / scale).toFixed(3)}"`
+        + ` width="${SEP_W}" height="${SEP_BOX_H}">`
+        + `<g transform="translate(0 ${(offsetPx / scale).toFixed(3)})">`
+        + `<path d="M2 8H14M5 5 2 8l3 3M11 5l3 3-3 3"`
+        + ` fill="none" stroke="${color}" stroke-width="1.1"`
+        + ` stroke-linecap="round" stroke-linejoin="round"/>`
+        + `</g></svg>`;
+    // 这个箭头不在链接里，可以用标签（svgImage 那种图片写法是给芯片里的图标
+    // 留的，见它的注释）。
+    return htmlImg(`data:image/svg+xml,${encodeURIComponent(svg)}`, SEP_W, SEP_BOX_H);
+}
+
+/**
+ * 增删块。用 <p> 包一层、每行一个 <code>，不用 <pre>。
+ *
+ * <pre> 在浮窗里没有任何 CSS 命中，吃的是浏览器默认 `margin: 1em 0`，上下各多出
+ * 十几像素，和两根分割条离得老远。浮窗只给 p / .code / ul / h1-h6 设了 8px 边距，
+ * 而 p:first-child + p:last-child 会被清零——这一块里只有这个 <p>，两条都命中，
+ * 于是上下边距为 0，只剩 .hover-contents 那 4px 内边距。
+ *
+ * 等宽字体来自 <code>（.monaco-hover code 给了 --monaco-monospace-font）。逐行
+ * 各包一个而不是整块包一个：<code> 带 `padding: 0 .4em`，整块包时那点内边距只
+ * 落在首行行首，续行就会错开半个字。
+ */
+function diffBlock(diff: readonly LineBlameDiffLine[]): string {
+    const mark = operatorColor();
+    const lines = diffRows(diff).map(row => {
+        // diffRows 给的行首固定两格：首行是 `+ ` / `- `，续行是空白。
+        const prefix = row.text.slice(0, 2);
+        const body = row.text.slice(2);
+        const marked = prefix.trim()
+            // 照 .cw-line-blame-hover-diff-mark 的 font-weight: 600；
+            // 浮窗不认 font-weight，只能用标签。
+            ? `<strong><span style="color:${mark};">${keepSpaces(prefix)}</span></strong>`
+            : `<span style="color:${mark};">${keepSpaces(prefix)}</span>`;
+        const text = body
+            ? `<span style="color:${diffColor(row.kind)};">${keepSpaces(body)}</span>`
+            : '';
+        return `<code>${marked}${text}</code>`;
+    });
+    return `<p>${lines.join('<br>')}</p>`;
+}
+
+/** 逐字照搬 media/lineBlame.js 的 Changes 脚注措辞，两边不该有出入。 */
+function changesLine(hover: LineBlameHoverInfo): string {
+    // webview 的脚注文字比正文淡一档，芯片才是亮的。
+    const label = (text: string) => tint(palette().muted, text);
+    const sep = separatorImage(palette().muted);
+    if (hover.workingTree) {
+        const left = hover.previousShortSha || '';
+        const sameRef = !!(hover.previousSha && hover.sha && hover.previousSha === hover.sha);
+        const right = (!sameRef && hover.shortSha)
+            ? shaChip(hover.shortSha, hover.sha)
+            : label('Working Tree');
+        return left
+            ? `${label('Changes')} ${shaChip(left, hover.previousSha || left, true)} ${sep} ${right}`
+            : `${label('Changes')} ${right}`;
+    }
+    if (hover.previousShortSha && hover.shortSha) {
+        const previous = shaChip(hover.previousShortSha, hover.previousSha || hover.previousShortSha, true);
+        return `${label('Changes')} ${previous} ${sep} ${shaChip(hover.shortSha, hover.sha)}`;
+    }
+    if (hover.shortSha) {
+        // 首提交没有 parent：GitLens 仍固定写 Changes added in <sha>。
+        return `${label('Changes added in')} ${shaChip(hover.shortSha, hover.sha)}`;
+    }
+    return label('Uncommitted changes');
+}
+
+function section(): vscode.MarkdownString {
+    const md = new vscode.MarkdownString();
+    // isTrusted 同时是脚注 command: 链接和 <span style> 上色的前提；
+    // 所有取自仓库的文本都已转义。
+    md.isTrusted = true;
+    md.supportThemeIcons = true;
+    md.supportHtml = true;
+    return md;
+}
+
+interface HoverParts {
+    tips: vscode.MarkdownString;
+    diff?: vscode.MarkdownString;
+    foot?: vscode.MarkdownString;
+}
+
+/**
+ * 三个 hover part：作者和提交 / 增删 / Changes。两根分割条都由编辑器在相邻
+ * part 之间画，我们一根都不自己画。
+ *
+ * 自己画不出等长的线。手写的 `---` 落在 .hover-contents 里，它自带的
+ * margin:-8px 只够抵消内容区那 8px 内边距；而带拷贝按钮的行（.hover-row-with-copy）
+ * 右侧还留了 20px 给按钮，线就比上面那根短 20px。想补回来得改外边距，可
+ * VS Code 的消毒器只在 <span> 上放行 style，hr 上写什么都会被抹掉。
+ * 交给编辑器画则天然一致：那两根线是同一条 .hover-row 顶边框。
+ *
+ * 代价是拷贝按钮从两颗变三颗，增删和 Changes 各拷各的，不再像 webview 那样
+ * 一起拷。
+ */
+function buildHover(
+    info: LineBlameInfo,
+    diff: readonly LineBlameDiffLine[],
+    uriString: string,
+    line1Based: number
+): HoverParts {
+    const hover = info.hover;
+    const tips = section();
+    appendHeader(tips, hover, diff);
+    appendMessage(tips, hover.summary || '');
+    if (hover.shortSha && !hover.workingTree) {
+        tips.appendMarkdown(shaChip(hover.shortSha, hover.sha));
+    }
+
+    const parts: HoverParts = { tips };
+    if (diff.length) {
+        const code = section();
+        code.appendMarkdown(diffBlock(diff));
+        parts.diff = code;
+    }
+
+    const foot = section();
+    let changes = changesLine(hover);
+    if (hover.sha || hover.workingTree) {
+        const args: OpenChangesArgs = {
+            uri: uriString,
+            line: line1Based,
+            sha: hover.sha,
+            previousSha: hover.previousSha || '',
+            workingTree: !!hover.workingTree
+        };
+        changes += ` &nbsp;[${openChangesImage(palette().icon)}]`
+            + `(${commandLink(OPEN_CHANGES_COMMAND, args)} "Open Changes")`;
+    }
+    // 和头像那行一样包一层表格，卡片上下留白才对称：浮窗只给内容区 4px 内边距，
+    // 表格自己还带 2px 的 border-spacing 和 1px 的单元格内边距。顶上是表格、
+    // 底下是段落的话，底边就少那 3px。这 3px 没法单独补——p:last-child 的
+    // margin-bottom 被浮窗清零了，而给它加个兄弟节点又会一次多出 8px。
+    // 两头用同一种结构，多少像素都对得上，不必写死。
+    //
+    // 单元格里那两个空行是必需的，不是排版好看。markdown 的 HTML 块到空行为止，
+    // 所以空行之间这段会照常当 markdown 解析，芯片的 `[x](y)` 仍然变成真链接
+    // （浮窗的拷贝和 Open Changes 全靠它：点击走 a[data-href]，提示来自链接标题）。
+    // 少了空行，整块就是原样 HTML，芯片会变成不能点、没提示的死字符。
+    // 闭合标签同理，也要自己单独成块。
+    // 单元格里的 p 既是 first-child 又是 last-child，上下外边距都被浮窗清零，
+    // 所以不会多占高度。
+    foot.appendMarkdown(`<table><tr><td>\n\n${changes}\n\n</td></tr></table>`);
+    parts.foot = foot;
+    return parts;
+}
+
+/**
+ * 该行有未保存的改动时的注解。此时不能用 git 的答案：blame 按磁盘算行号，
+ * 编辑器里插入或删除过行，行号就已经对不上了。但「这一行和磁盘不一样，而且
+ * 文档是脏的」本身就足以断定它是当前用户尚未提交的改动，不必再问 git。
+ */
+function unsavedHover(): HoverParts {
+    const tips = section();
+    tips.appendMarkdown('$(account) **You**&nbsp; &nbsp; &nbsp;Uncommitted changes\n\n');
+    tips.appendMarkdown(tint(
+        palette().muted,
+        'This line differs from the file on disk. Save it to see who last changed the surrounding code.'
+    ));
+    return { tips };
+}
+
+function wipe(editor: vscode.TextEditor, ...types: vscode.TextEditorDecorationType[]): void {
+    for (const type of types) {
+        try {
+            editor.setDecorations(type, []);
+        } catch {
+            // 编辑器已经关掉了，装饰随之消失。
+        }
+    }
+}
+
+export function registerEditorLineBlame(context: vscode.ExtensionContext): void {
+    const annotation = vscode.window.createTextEditorDecorationType({
+        after: {
+            // 与 Context Window 里那条注解同样的留白和颜色（main.css 的 .cw-line-blame）。
+            margin: '0 0 0 6ch',
+            color: new vscode.ThemeColor('contextView.lineBlameForeground')
+        }
+    });
+    // 后两条不画字，只各贡献一个 hover part：增删、Changes。
+    // 顺序就是这里创建、下面 setDecorations 的顺序，浮窗里的先后与之一致。
+    const diffHover = vscode.window.createTextEditorDecorationType({});
+    const footHover = vscode.window.createTextEditorDecorationType({});
+
+    /** 当前画着注解的编辑器和行，用来判断某次事件是否让它失效。 */
+    let decorated: { editor: vscode.TextEditor; line: number } | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    /** blame 是异步的；光标可能已经走了。只认最后一次请求的结果。 */
+    let generation = 0;
+
+    const clear = () => {
+        generation++;
+        const previous = decorated;
+        decorated = undefined;
+        if (!previous) {
+            return;
+        }
+        wipe(previous.editor, annotation, diffHover, footHover);
+    };
+
+    const apply = (
+        editor: vscode.TextEditor,
+        line0Based: number,
+        text: string,
+        hover: HoverParts
+    ) => {
+        if (decorated && decorated.editor !== editor) {
+            wipe(decorated.editor, annotation, diffHover, footHover);
+        }
+        const end = editor.document.lineAt(line0Based).range.end;
+        const range = new vscode.Range(end, end);
+        editor.setDecorations(annotation, [{
+            range,
+            hoverMessage: hover.tips,
+            renderOptions: { after: { contentText: text } }
+        }]);
+        editor.setDecorations(diffHover, hover.diff
+            ? [{ range, hoverMessage: hover.diff }]
+            : []);
+        editor.setDecorations(footHover, hover.foot
+            ? [{ range, hoverMessage: hover.foot }]
+            : []);
+        decorated = { editor, line: line0Based };
+    };
+
+    const refresh = async () => {
+        if (!isEnabled()) {
+            clear();
+            return;
+        }
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            clear();
+            return;
+        }
+        const doc = editor.document;
+        // blame 只对磁盘上的文件有意义。diff 的左侧、untitled、各种虚拟文档都跳过。
+        if (doc.uri.scheme !== 'file') {
+            clear();
+            return;
+        }
+        const selection = editor.selection;
+        // 拖选过程中不要重画行尾 after 文字：从行首拖到行尾时选区盖住装饰落点，
+        // setDecorations 会让行闪一下，鼠标打到 after 上还会把选区清掉。
+        if (!selection.isEmpty) {
+            return;
+        }
+        const line0 = selection.active.line;
+        if (line0 >= doc.lineCount) {
+            clear();
+            return;
+        }
+
+        const mine = ++generation;
+        const uriString = doc.uri.toString();
+        // 期间光标移动、切了编辑器、开关被关掉，或文档被删短到这一行已不存在
+        // （lineAt 会抛），这次结果就作废。
+        const stillMine = () => mine === generation
+            && vscode.window.activeTextEditor === editor
+            && editor.selection.isEmpty
+            && editor.selection.active.line === line0
+            && line0 < doc.lineCount
+            && isEnabled();
+
+        let info: LineBlameInfo | undefined;
+        try {
+            info = await blameLine(uriString, line0 + 1);
+        } catch {
+            info = undefined;
+        }
+        if (!stillMine()) {
+            return;
+        }
+
+        const stale = info?.content !== undefined && info.content !== doc.lineAt(line0).text;
+        if (stale) {
+            if (doc.isDirty) {
+                apply(editor, line0, 'You, Uncommitted changes', unsavedHover());
+            } else {
+                // 文档是干净的却对不上磁盘，说明磁盘刚被外部改过（checkout 之类），
+                // 手上这份已经过期。宁可不显示，等下一次刷新。
+                clear();
+            }
+            return;
+        }
+        if (!info?.text) {
+            clear();
+            return;
+        }
+
+        // 行尾文字先画出来，不等增删。webview 是浮窗打开后才拉 diff，而
+        // hoverMessage 是静态的、只能预先备好，所以这里拿两步走近似那个效果：
+        // 注解立刻可见，浮窗随后升级成带 diff 的完整版本。中间这一小段时间里
+        // 划过去只是少一块 diff，不会看到空浮窗。
+        const blame = info;
+        let shownDiff: readonly LineBlameDiffLine[] = [];
+        const draw = () => apply(
+            editor,
+            line0,
+            blame.text,
+            buildHover(blame, shownDiff, uriString, line0 + 1)
+        );
+        draw();
+
+        // 头像同理：先用首字母牌子，图取回来了再重画一次。取不到就一直是牌子。
+        const avatarUrl = avatarSrc(blame.hover);
+        if (avatarUrl && shouldFetchAvatar(avatarUrl)) {
+            void loadAvatar(avatarUrl).then(src => {
+                if (src && stillMine()) {
+                    draw();
+                }
+            });
+        }
+
+        let diff: readonly LineBlameDiffLine[] | undefined;
+        try {
+            // 同一提交的相邻行命中 fileDiffCache，不会每行都真去打 git diff。
+            diff = await blameLineDiff(uriString, line0 + 1);
+        } catch {
+            diff = undefined;
+        }
+        if (!diff?.length || !stillMine()) {
+            return;
+        }
+        shownDiff = diff;
+        draw();
+    };
+
+    const schedule = () => {
+        if (timer) {
+            clearTimeout(timer);
+        }
+        timer = setTimeout(() => {
+            timer = undefined;
+            void refresh();
+        }, SETTLE_MS);
+    };
+
+    context.subscriptions.push(
+        // SHA 芯片的点击拷贝。分区拷贝走编辑器自己的 HoverCopyButton，不经过这里。
+        vscode.commands.registerCommand(COPY_COMMAND, async (args?: CopyArgs) => {
+            if (!args?.text) {
+                return;
+            }
+            await vscode.env.clipboard.writeText(args.text);
+            if (args.notify) {
+                vscode.window.setStatusBarMessage(args.notify, 2000);
+            }
+        }),
+        vscode.commands.registerCommand(OPEN_CHANGES_COMMAND, async (args?: OpenChangesArgs) => {
+            if (!args?.uri || (!args.sha && !args.workingTree)) {
+                return;
+            }
+            try {
+                await openBlameDiff(args.uri, args.previousSha || '', args.sha, {
+                    workingTree: args.workingTree,
+                    line: args.line
+                });
+            } catch (err) {
+                console.error('[context-window] open line blame changes failed:', err);
+                vscode.window.showErrorMessage('Failed to open git changes');
+            }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.window.onDidChangeTextEditorSelection(e => {
+            if (e.textEditor !== vscode.window.activeTextEditor) {
+                return;
+            }
+            // 光标换行、或者选区拉成了跨行，画着的那条就不再属于当前行了。等
+            // blame 回来再换会留下一段旧行仍带注解的时间，所以先清掉，宁可空一下。
+            // 同一行内移动不动它，免得敲着方向键一路闪。
+            const selection = e.textEditor.selection;
+            const leftTheLine = decorated
+                && (decorated.line !== selection.active.line
+                    || selection.start.line !== selection.end.line);
+            if (leftTheLine) {
+                clear();
+            }
+            // 非空选区：取消已排队的刷新，避免拖选中途 setDecorations。
+            // 已画着的注解先留着，免得行尾假文字突然消失造成布局跳动。
+            if (!selection.isEmpty) {
+                if (timer) {
+                    clearTimeout(timer);
+                    timer = undefined;
+                }
+                return;
+            }
+            schedule();
+        }),
+        vscode.window.onDidChangeActiveTextEditor(() => {
+            // 立刻清掉：上一份注解属于另一个文件，留着就是错的。
+            clear();
+            schedule();
+        }),
+        vscode.workspace.onDidChangeTextDocument(e => {
+            if (e.document !== vscode.window.activeTextEditor?.document) {
+                return;
+            }
+            // 文档一改，画着的注解就作废了：装饰的 range 跟着编辑平移，所以在
+            // 上方插入或删除行时，它会连着旧行的内容一起漂到别处，而 git 的答案
+            // 也已经对不上磁盘。停手后 refresh 会给出「Uncommitted changes」。
+            clear();
+            schedule();
+        }),
+        vscode.workspace.onDidSaveTextDocument(doc => {
+            if (doc === vscode.window.activeTextEditor?.document) {
+                schedule();
+            }
+        }),
+        vscode.workspace.onDidChangeConfiguration(e => {
+            if (e.affectsConfiguration(`${CONFIG_SECTION}.${CONFIG_ENABLED}`)) {
+                clear();
+                schedule();
+            }
+        }),
+        // 浮窗里的颜色是写死的十六进制，明暗两套靠主题类型选。换了主题就得重建，
+        // 否则手上这份浮窗会在新主题下用旧那套颜色。
+        vscode.window.onDidChangeActiveColorTheme(() => {
+            // 操作符色是从主题 JSON 解析出来缓存的，同为深色的两个主题之间切换
+            // 也会变，不能只看明暗，得直接扔掉重算。
+            operatorColorCache = undefined;
+            clear();
+            schedule();
+        })
+    );
+
+    context.subscriptions.push({
+        dispose: () => {
+            if (timer) {
+                clearTimeout(timer);
+            }
+            annotation.dispose();
+            diffHover.dispose();
+            footHover.dispose();
+        }
+    });
+
+    schedule();
+}

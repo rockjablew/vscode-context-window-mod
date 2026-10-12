@@ -3,6 +3,7 @@
 // 定义列表面板 UI：文件名显示、悬浮预览、列表渲染、键盘导航等。
 // 以工厂函数形式创建，内部持有 editor 引用与各自的私有状态。
 
+/** @param {import('monaco-editor').editor.IStandaloneCodeEditor} editor */
 export function createDefinitionList(editor) {
     const vscode = window.vscode;
 
@@ -69,7 +70,6 @@ export function createDefinitionList(editor) {
         const pathContainer = filenameDisplay?.querySelector('.filename-path');
         const icon = pathContainer?.querySelector('.filename-icon');
         const pathText = pathContainer?.querySelector('.filename-path-text');
-        const filenameText = filenameDisplay?.querySelector('.filename-text');
         if (uri && filenameDisplay) {
             let filePath = uri;
             try {
@@ -82,27 +82,17 @@ export function createDefinitionList(editor) {
             //const displayText = `${filename}       (${filePath})`;
             //console.log('[definition] File name:', filename, uri);
             //filenameDisplay.textContent = displayText || '';
-            filenameText.textContent = filename;
-            filenameText.title = filename || '';
-            filenameDisplay.title = filePath;
-            pathContainer.title = filePath;
+            filenameDisplay.querySelector('.filename-text').textContent = filename;
             icon.textContent = '📄'; // 你想用的Unicode图标
             icon.style.display = 'inline-block';
             pathText.textContent = filePath;
-            pathText.title = filePath;
-            pathContainer.scrollLeft = 0;
             // 有文件名显示时才显示底部 { } 指示器
             document.body.classList.add('ctx-has-file');
         } else if (filenameDisplay) {
-            filenameText.textContent = "";
-            filenameText.title = "";
-            filenameDisplay.title = "";
-            pathContainer.title = "";
+            filenameDisplay.querySelector('.filename-text').textContent = "";
             icon.textContent = "";
             icon.style.display = 'none';
             pathText.textContent = "";
-            pathText.title = "";
-            pathContainer.scrollLeft = 0;
             // 无文件名显示时同时隐藏 { } 指示器
             document.body.classList.remove('ctx-has-file');
         }
