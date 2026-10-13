@@ -683,7 +683,7 @@ const TYPE_NAME_NOISE = new Set([
 /** Type names written after the last `:` in a hover, one per union member. */
 function declaredTypeNames(hover: string, index?: number): string[] {
     const stripped = (hover || '').replace(/```(?:\w+)?/g, '');
-    const line = stripped.split(/\r?\n/).map(part => part.trim()).find(part => /:\s*[A-Za-z_$\[]/.test(part));
+    const line = stripped.split(/\r?\n/).map(part => part.trim()).find(part => /:\s*[A-Za-z_$[]/.test(part));
     if (!line) {
         return [];
     }

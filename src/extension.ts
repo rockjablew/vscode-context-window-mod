@@ -633,7 +633,7 @@ function registerBracketPairSelectionOnDoubleClick(context: vscode.ExtensionCont
     // 把 gesture.applied 一并清掉 → 自愈 B 再也不会执行 → 大面积括号选定与被劫持的拖拽锚点
     // 就永久留在编辑器里（reload 窗口后首次 IPC 未预热、延迟最大，故那一次必然复现）。
     // 因此改用与 enclosingSymbol.ts 相同的做法：记下自己写入的选区，事件到达时按内容比对并跳过。
-    let pendingEchoes: vscode.Selection[] = [];
+    const pendingEchoes: vscode.Selection[] = [];
 
     const rememberEcho = (sel: vscode.Selection) => {
         pendingEchoes.push(sel);

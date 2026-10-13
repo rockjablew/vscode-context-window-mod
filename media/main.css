@@ -1217,6 +1217,7 @@ body .monaco-editor .find-widget {
     font-style: italic;
     padding-left: 6px;
     box-sizing: border-box;
+    overflow: hidden;
 }
 /* 添加文件名显示样式 */
 .filename-display {
@@ -1227,12 +1228,14 @@ body .monaco-editor .find-widget {
     font-size: 14px;
     font-weight: normal;
     font-style: normal;
-    max-width: 100%;
+    width: 100%;
+    max-width: none;
     overflow: hidden;
-    text-overflow: ellipsis;
+    white-space: nowrap;
     /*white-space: pre;*/
     z-index: 1002;
     padding-left: 0px;
+    gap: 12px;
 }
 .filename-text {
     /*font-weight: bold;*/
@@ -1241,22 +1244,27 @@ body .monaco-editor .find-widget {
     text-align: left;
     overflow: hidden;
     text-overflow: ellipsis;
-    max-width: 200px;
+    max-width: 240px;
+    flex-shrink: 0;
 }
 
 .filename-path {
     display: flex;
+    align-items: center;
     color: var(--vscode-descriptionForeground);
     font-size: 13px;
-    margin-left: 12px;
+    margin-left: 0;
     white-space: nowrap;
     text-align: left;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    /* 路径过长时出现横向滚动条，可拖动查看完整路径 */
+    overflow-x: auto;
+    overflow-y: hidden;
     /*max-width: 60%;*/
     min-width: 0;
     flex: 1;
-    gap: 0
+    gap: 0;
+    scrollbar-width: thin;
+    scrollbar-color: var(--vscode-scrollbarSlider-background) transparent;
 }
 
 .filename-icon {
@@ -1270,13 +1278,30 @@ body .monaco-editor .find-widget {
     font-family: 'Segoe UI Emoji', sans-serif;
 }
 .filename-path-text {
-    overflow: hidden;
+    overflow: visible;
     margin: 0;
-    text-overflow: ellipsis;
+    text-overflow: clip;
     white-space: nowrap;
     min-width: 0;
-    flex: 1;
+    flex: 0 0 auto;
     padding: 0;
+}
+
+.filename-path::-webkit-scrollbar {
+    height: 6px;
+}
+
+.filename-path::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.filename-path::-webkit-scrollbar-thumb {
+    background: rgba(128, 128, 128, 0.35);
+    border-radius: 3px;
+}
+
+.filename-path:hover::-webkit-scrollbar-thumb {
+    background: rgba(128, 128, 128, 0.55);
 }
 .custom-context-menu {
     position: fixed;
@@ -1434,4 +1459,21 @@ ol {
 	left: -9999px !important;
 	top: -9999px !important;
 	pointer-events: none !important;
+}
+/* 路径完整显示浮窗样式 */
+.filename-tip {
+    position: fixed;
+    max-width: min(90vw, 800px);
+    padding: 4px 8px;
+    background: var(--vscode-editorHoverWidget-background);
+    color: var(--vscode-editorHoverWidget-foreground);
+    border: 1px solid var(--vscode-editorHoverWidget-border);
+    border-radius: 3px;
+    font-size: 12px;
+    line-height: 1.4;
+    word-break: break-all;
+    white-space: normal;
+    z-index: 10000;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+    pointer-events: none;
 }

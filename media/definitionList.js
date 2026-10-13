@@ -86,6 +86,8 @@ export function createDefinitionList(editor) {
             icon.textContent = '📄'; // 你想用的Unicode图标
             icon.style.display = 'inline-block';
             pathText.textContent = filePath;
+            filenameDisplay.dataset.fullPath = filePath;
+            pathText.dataset.fullPath = filePath;
             // 有文件名显示时才显示底部 { } 指示器
             document.body.classList.add('ctx-has-file');
         } else if (filenameDisplay) {
@@ -93,6 +95,8 @@ export function createDefinitionList(editor) {
             icon.textContent = "";
             icon.style.display = 'none';
             pathText.textContent = "";
+            delete filenameDisplay.dataset.fullPath;
+            delete pathText.dataset.fullPath;
             // 无文件名显示时同时隐藏 { } 指示器
             document.body.classList.remove('ctx-has-file');
         }
@@ -379,3 +383,41 @@ export function createDefinitionList(editor) {
         updateFilenameDisplay
     };
 }
+    function setupFilenameTooltip(){
+        var fd = document.querySelector('.filename-display');
+        var pt = document.querySelector('.filename-path-text');
+        var tip = document.getElementById('filename-tip');
+        if(!fd || !tip) return;
+        var ht = null;
+        function st(el,t){
+            if(!t) return;
+            tip.textContent = t;
+            tip.hidden = false;
+            var r = el.getBoundingClientRect();
+            var tr = tip.getBoundingClientRect();
+            var left = r.left;
+            var top = r.bottom + 4;
+            if(left + tr.width > window.innerWidth - 8) left = window.innerWidth - tr.width - 8;
+            if(top + tr.height > window.innerHeight - 8) top = r.top - tr.height - 4;
+            tip.style.left = Math.max(8,left) + 'px';
+            tip.style.top = Math.max(8,top) + 'px';
+        }
+        function hh(){
+            tip.hidden = true;
+        }
+        var els = [fd,pt].filter(function(x){return !!x;});
+        for(var i=0;i<els.length;i++){
+            (function(el){
+                el.addEventListener('mouseenter', function(){
+                    if(ht){ clearTimeout(ht); ht = null; }
+                    var full = el.dataset.fullPath || (pt && pt.dataset.fullPath) || fd.dataset.fullPath;
+                    st(el, full);
+                });
+                el.addEventListener('mouseleave', function(){ ht = setTimeout(hh, 100); });
+            })(els[i]);
+        }
+        tip.addEventListener('mouseenter', function(){ if(ht){ clearTimeout(ht); ht = null; } });
+        tip.addEventListener('mouseleave', hh);
+    }
+    if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', setupFilenameTooltip);
+    else setupFilenameTooltip();
